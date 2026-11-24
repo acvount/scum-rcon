@@ -539,6 +539,8 @@ static GtCallCtx g_gtc;
 // 鏈€杩戜竴娆?gtcall/gtcallpe 鐨勫弬鏁板揩鐓э紙gtparms 璇诲彇杩斿洖鍊硷級
 static uint8_t g_lastParms[512];
 static int g_lastParmsSize = 0;
+// 本地注入调用计数：>0 = 调用来自本工具，管理员命令检查直接放行
+static volatile LONG g_injectDepth = 0;
 
 extern "C" void LoadTaskInvokeC() {
     InterlockedExchange(&g_gtCapture, 1);
@@ -1060,11 +1062,13 @@ uintptr_t target = GetVtSlot("GameEngine", 86);
     g_loadRec.expectedTid = 0;
     g_loadRec.result = -1;
     InterlockedExchange(&g_loadRec.state, 0);
+    InterlockedIncrement(&g_injectDepth);   // 标记：本调用来自本地工具
     bool fired = false;
     for (int i = 0; i < 10000; ++i) {
         if (InterlockedCompareExchange(&g_loadRec.state, 3, 3) == 2) { fired = true; break; }
         Sleep(1);
     }
+    InterlockedDecrement(&g_injectDepth);
     if (!fired) InterlockedExchange(&g_loadRec.state, 2);
     int ex = g_gtc.ex;
     // 淇濈暀鏈€鍚庝竴浠?parms 蹇収锛堢敤浜庤鍙栬繑鍥炲€硷級
@@ -1251,6 +1255,8 @@ static bool MemReadable(const void* p, size_t n) {
 }
 
 static int __cdecl AdminCheckFilter(void* pstr) {
+    // 本工具发起的调用：一律放行（与玩家 SteamID / 管理员名单无关）
+    if (InterlockedCompareExchange(&g_injectDepth, 0, 0) > 0) return 1;
     static volatile LONG s_calls = 0;
     int idx = (int)InterlockedIncrement(&s_calls);
     if (!pstr) { if (idx <= 40) Log("[admfilter] #%d null ptr", idx); return 0; }
@@ -1411,6 +1417,687 @@ static std::string CmdAdmState(const std::vector<std::string>& a) {
 
 // 鎸?OuterPrivate 鏌ユ壘鎵€鏈夊瓙瀵硅薄锛氳繑鍥
 // returns {i, addr, nameId, nameNum, classId}
+// ================= 实时事件 → 本地队列 → HTTP 回调 =================
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
+
+static std::string  g_cbUrl;
+static bool         g_cbEnable = false;
+static void*        g_chatStub = nullptr;
+static void*        g_chatTramp = nullptr;
+static std::mutex   g_qMtx;
+static std::condition_variable g_qCv;
+static std::deque<std::string> g_q;
+static volatile LONG g_cbSent = 0, g_cbFail = 0, g_cbDropped = 0;
+
+static std::string CbUtf16ToUtf8(const wchar_t* s, int n) {
+    std::string out;
+    for (int i = 0; i < n; ++i) {
+        unsigned int c = (unsigned int)s[i];
+        if (c < 0x80) out += (char)c;
+        else if (c < 0x800) { out += (char)(0xC0 | (c >> 6)); out += (char)(0x80 | (c & 0x3F)); }
+        else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
+            unsigned int lo = (unsigned int)s[i + 1];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                unsigned int cp = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F));
+                out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F));
+                ++i; continue;
+            }
+            out += '?';
+        } else if (c >= 0xDC00 && c <= 0xDFFF) out += '?';
+        else { out += (char)(0xE0 | (c >> 12)); out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
+    }
+    return out;
+}
+
+// 编码回滚：游戏服务端把 UTF-8 字节按 GBK 解码，导致"你好"→"浣犲ソ"。
+// 做法：把 wchar 按 GBK 编码回字节，再按 UTF-8 解码；成功则采用（即原始文本），
+// 失败说明本来就是真中文，保留原样。
+static std::string CbFixWide(const wchar_t* s, int n) {
+    if (!s || n <= 0) return "";
+    bool hasCjk = false;
+    for (int i = 0; i < n; ++i) {
+        unsigned int c = (unsigned int)s[i];
+        if (c >= 0x4E00 && c <= 0x9FFF) { hasCjk = true; break; }
+    }
+    if (hasCjk) {
+        int cb = WideCharToMultiByte(936, 0, s, n, nullptr, 0, nullptr, nullptr);
+        if (cb > 0) {
+            std::string gbk((size_t)cb, '\0');
+            WideCharToMultiByte(936, 0, s, n, &gbk[0], cb, nullptr, nullptr);
+            int wl = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, gbk.data(), cb, nullptr, 0);
+            if (wl > 0) {
+                std::wstring w((size_t)wl, L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, gbk.data(), cb, &w[0], wl);
+                return CbUtf16ToUtf8(w.c_str(), wl);
+            }
+        }
+    }
+    return CbUtf16ToUtf8(s, n);
+}
+
+static std::string CbJsonEsc(const std::string& s) {
+    std::string o;
+    for (unsigned char c : s) {
+        switch (c) {
+        case '"': o += "\\\""; break;
+        case '\\': o += "\\\\"; break;
+        case '\n': o += "\\n"; break;
+        case '\r': o += "\\r"; break;
+        case '\t': o += "\\t"; break;
+        default:
+            if (c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+            else o += (char)c;
+        }
+    }
+    return o;
+}
+
+static std::string CbNowStamp() {
+    SYSTEMTIME t; GetLocalTime(&t);
+    char b[40];
+    snprintf(b, sizeof(b), "%04d.%02d.%02d-%02d.%02d.%02d",
+             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    return b;
+}
+
+static std::string CbReadFString(const uint8_t* p) {
+    if (!MemReadable(p, 16)) return "";
+    const wchar_t* s = *(const wchar_t**)p;
+    int32_t n = *(int32_t*)(p + 8);
+    if (!s || n <= 1 || n > 256) return "";
+    if (!MemReadable(s, (size_t)n * 2)) return "";
+    return CbUtf16ToUtf8(s, n - 1);
+}
+
+static std::string CbJsonGetString(const std::string& js, const std::string& key) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = js.find(pat);
+    if (p == std::string::npos) return "";
+    p = js.find(':', p + pat.size());
+    if (p == std::string::npos) return "";
+    ++p;
+    while (p < js.size() && isspace((unsigned char)js[p])) ++p;
+    if (p >= js.size() || js[p] != '"') return "";
+    ++p;
+    std::string out;
+    while (p < js.size() && js[p] != '"') {
+        if (js[p] == '\\' && p + 1 < js.size()) {
+            char c = js[p + 1];
+            if (c == 'n') out += '\n'; else if (c == 't') out += '\t'; else out += c;
+            p += 2; continue;
+        }
+        out += js[p++];
+    }
+    return out;
+}
+
+static bool CbJsonGetBool(const std::string& js, const std::string& key, bool def) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = js.find(pat);
+    if (p == std::string::npos) return def;
+    p = js.find(':', p + pat.size());
+    if (p == std::string::npos) return def;
+    ++p;
+    while (p < js.size() && isspace((unsigned char)js[p])) ++p;
+    return js.compare(p, 4, "true") == 0;
+}
+
+static bool CbHttpPost(const std::string& url, const std::string& body) {
+    if (url.rfind("http://", 0) != 0) return false;
+    std::string rest = url.substr(7);
+    size_t slash = rest.find('/');
+    std::string hostport = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+    std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+    std::string host = hostport;
+    INTERNET_PORT port = 80;
+    size_t colon = hostport.find(':');
+    if (colon != std::string::npos) {
+        host = hostport.substr(0, colon);
+        port = (INTERNET_PORT)atoi(hostport.c_str() + colon + 1);
+    }
+    std::wstring whost(host.begin(), host.end());
+    std::wstring wpath(path.begin(), path.end());
+    HINTERNET ses = WinHttpOpen(L"SCUMHarness/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) return false;
+    HINTERNET con = WinHttpConnect(ses, whost.c_str(), port, 0);
+    if (!con) { WinHttpCloseHandle(ses); return false; }
+    HINTERNET req = WinHttpOpenRequest(con, L"POST", wpath.c_str(), nullptr,
+                                       WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!req) { WinHttpCloseHandle(con); WinHttpCloseHandle(ses); return false; }
+    std::wstring hdr = L"Content-Type: application/json; charset=utf-8\r\nConnection: close\r\n";
+    BOOL ok = WinHttpSendRequest(req, hdr.c_str(), (DWORD)-1L,
+                                 (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0);
+    if (ok) ok = WinHttpReceiveResponse(req, nullptr);
+    DWORD status = 0, len = sizeof(status);
+    if (ok) WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &len, WINHTTP_NO_HEADER_INDEX);
+    WinHttpCloseHandle(req); WinHttpCloseHandle(con); WinHttpCloseHandle(ses);
+    return ok && status >= 200 && status < 300;
+}
+
+static void CbPush(const std::string& json) {
+    {
+        std::lock_guard<std::mutex> g(g_qMtx);
+        if (g_q.size() > 2000) { ++g_cbDropped; return; }
+        g_q.push_back(json);
+    }
+    g_qCv.notify_one();
+}
+
+static void CbWorker() {
+    for (;;) {
+        std::string ev;
+        {
+            std::unique_lock<std::mutex> lk(g_qMtx);
+            g_qCv.wait(lk, [] { return !g_q.empty(); });
+            ev = g_q.front();
+            g_q.pop_front();
+        }
+        std::string url = g_cbUrl;
+        if (url.empty()) { ++g_cbFail; continue; }
+        bool ok = CbHttpPost(url, ev);
+        if (!ok) ok = CbHttpPost(url, ev);
+        if (ok) ++g_cbSent; else { ++g_cbFail; Log("[cb] post failed: %.120s", ev.c_str()); }
+    }
+}
+
+static void CbReloadConfig() {
+    std::string path = ModuleDir() + "\\YG_CONFIG.json";
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { Log("[cb] no config (%s)", path.c_str()); return; }
+    char buf[4096] = {0};
+    DWORD rd = 0;
+    ReadFile(h, buf, sizeof(buf) - 1, &rd, nullptr);
+    CloseHandle(h);
+    std::string js(buf, strnlen(buf, sizeof(buf)));
+    g_cbEnable = CbJsonGetBool(js, "enable", false);
+    g_cbUrl = CbJsonGetString(js, "url");
+    Log("[cb] config: enable=%d url=%s", g_cbEnable ? 1 : 0, g_cbUrl.c_str());
+}
+
+// ============ 日志文件近实时结构化（文件尾部增量 → 事件）============
+#include <map>
+#include <string>
+
+static std::map<std::string, unsigned long long> g_logOffsets;
+static std::map<std::string, unsigned long long> g_logLastSize;   // 上次看到的大小
+static std::map<std::string, int> g_logStable;                    // 大小不变计数
+static bool g_logsEnable = true;
+static volatile LONG g_logEvents = 0;
+
+static std::string CbLogsDir() {
+    return ModuleDir() + "\\..\\..\\Saved\\SaveFiles\\Logs";
+}
+
+static bool CbReadWhole(const std::string& path, unsigned long long from,
+                        std::string& out, unsigned long long& newSize) {
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); return false; }
+    unsigned long long total = (unsigned long long)sz.QuadPart;
+    if (total <= from) { newSize = total; CloseHandle(h); return true; }
+    unsigned long long want = total - from;
+    if (want > 256 * 1024) want = 256 * 1024;          // 单次最多读 256KB
+    LARGE_INTEGER pos; pos.QuadPart = (LONGLONG)(total - want);
+    if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) { CloseHandle(h); return false; }
+    out.resize((size_t)want);
+    DWORD rd = 0;
+    BOOL ok = ReadFile(h, &out[0], (DWORD)want, &rd, nullptr);
+    CloseHandle(h);
+    if (!ok) return false;
+    out.resize(rd);
+    newSize = total;
+    return true;
+}
+
+// 解析一行日志： "<ts>:  <text>"
+// login / logout 行结构化：
+// '192.168.1.112 76561199558480354:Ac(1)' logged in at: X=-644362.000 Y=-260984.000 Z=14534.000
+static bool CbEmitLogin(const std::string& type, const std::string& fileName,
+                        const std::string& ts, const std::string& text) {
+    (void)fileName;
+    size_t q1 = text.find('\'');
+    size_t q2 = (q1 == std::string::npos) ? std::string::npos : text.find('\'', q1 + 1);
+    if (q1 == std::string::npos || q2 == std::string::npos) return false;
+    std::string who = text.substr(q1 + 1, q2 - q1 - 1);   // "ip steamid:name(n)"
+    std::string ip, sid, name;
+    size_t sp = who.find(' ');
+    if (sp != std::string::npos) { ip = who.substr(0, sp); who = who.substr(sp + 1); }
+    size_t c1 = who.find(':');
+    if (c1 == std::string::npos) return false;
+    sid = who.substr(0, c1);
+    std::string nm = who.substr(c1 + 1);
+    size_t par = nm.find('(');
+    name = (par == std::string::npos) ? nm : nm.substr(0, par);
+
+    std::string action = "login";
+    if (text.find("logged out") != std::string::npos) action = "logout";
+    else if (text.find("logged in") == std::string::npos) return false;
+
+    std::string pos;
+    size_t x = text.find("X=");
+    if (x != std::string::npos) pos = text.substr(x);
+    for (auto& ch : pos) if (ch == ' ') ch = ',';
+
+    std::string json = "{\"event\":\"login\",\"steamID\":\"" + CbJsonEsc(sid) +
+                       "\",\"fackname\":\"" + CbJsonEsc(name) +
+                       "\",\"steamname\":\"" + CbJsonEsc(name) +
+                       "\",\"date\":\"" + CbJsonEsc(ts) +
+                       "\",\"data\":{\"action\":\"" + action + "\",\"ip\":\"" + CbJsonEsc(ip) +
+                       "\",\"position\":\"" + CbJsonEsc(pos) + "\",\"source\":\"log\"}}";
+    CbPush(json);
+    ++g_logEvents;
+    return true;
+}
+
+static void CbEmitLogLine(const std::string& type, const std::string& fileName, const std::string& line) {
+    std::string s = line;
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    if (s.empty()) return;
+    if (s.find("Game version:") != std::string::npos) return;   // 表头忽略
+
+    std::string ts, text;
+    // 行首形如 "2026.11.21-02.34.27: <text>" 或 "...:  <text>"（1~2 个空格）
+    size_t sep = std::string::npos, skip = 0;
+    if (s.size() > 12 && s[4] == '.' && s[7] == '.' && s[10] == '-') {
+        size_t c = s.find(':', 11);
+        if (c != std::string::npos && c < 32) {
+            sep = c;
+            skip = 1;
+            while (c + skip < s.size() && s[c + skip] == ' ') ++skip;
+        }
+    }
+    if (sep != std::string::npos) { ts = s.substr(0, sep); text = s.substr(sep + skip); }
+    else { ts = CbNowStamp(); text = s; }
+    // 文本里若仍带 "ts:  " 前缀则剥离（避免重复）
+    if (text.size() > sep + 3 && text.compare(0, ts.size(), ts) == 0) {
+        size_t q = text.find(":  ");
+        if (q != std::string::npos && q < 32) text = text.substr(q + 3);
+    }
+
+    if (type == "login" || type == "admin") {
+        if (CbEmitLogin(type, fileName, ts, text)) return;
+    }
+    if (type == "chat") {
+        // '76561199558480354:Ac(1)'  'Local:  hi'
+        std::string sid, name, rest;
+        size_t q1 = text.find('\'');
+        size_t q2 = (q1 == std::string::npos) ? std::string::npos : text.find('\'', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos) {
+            std::string who = text.substr(q1 + 1, q2 - q1 - 1);
+            size_t c1 = who.find(':');
+            if (c1 != std::string::npos) {
+                sid = who.substr(0, c1);
+                std::string nm = who.substr(c1 + 1);
+                size_t p = nm.find('(');
+                name = (p == std::string::npos) ? nm : nm.substr(0, p);
+            }
+            rest = text.substr(q2 + 1);
+        }
+        // 频道与消息
+        std::string chan, msg;
+        size_t r1 = rest.find('\'');
+        size_t r2 = (r1 == std::string::npos) ? std::string::npos : rest.find('\'', r1 + 1);
+        if (r1 != std::string::npos && r2 != std::string::npos) {
+            std::string inner = rest.substr(r1 + 1, r2 - r1 - 1);
+            size_t cc = inner.find(':');
+            if (cc != std::string::npos) {
+                chan = inner.substr(0, cc);
+                msg = inner.substr(cc + 1);
+                while (!msg.empty() && msg.front() == ' ') msg.erase(msg.begin());
+            } else {
+                msg = inner;
+            }
+        } else {
+            msg = rest;
+        }
+        // 频道名 → 枚举值
+        int ch = -1;
+        if (chan == "Local") ch = 1;
+        else if (chan == "Global") ch = 2;
+        else if (chan == "Squad") ch = 3;
+        else if (chan == "Admin") ch = 4;
+        std::string json = "{\"event\":\"im\",\"steamID\":\"" + CbJsonEsc(sid) +
+                           "\",\"fackname\":\"" + CbJsonEsc(name) +
+                           "\",\"steamname\":\"" + CbJsonEsc(name) +
+                           "\",\"date\":\"" + CbJsonEsc(ts) +
+                           "\",\"data\":{\"channel\":\"" + (ch > 0 ? std::to_string(ch) : CbJsonEsc(chan)) +
+                           "\",\"message\":\"" + CbJsonEsc(msg) +
+                           "\",\"source\":\"log\"}}";
+        CbPush(json);
+        ++g_logEvents;
+        return;
+    }
+
+    std::string json = "{\"event\":\"log\",\"type\":\"" + CbJsonEsc(type) +
+                       "\",\"steamID\":\"\",\"fackname\":\"\",\"steamname\":\"\"" +
+                       ",\"date\":\"" + CbJsonEsc(ts) +
+                       "\",\"data\":{\"text\":\"" + CbJsonEsc(text) +
+                       "\",\"file\":\"" + CbJsonEsc(fileName) + "\"}}";
+    CbPush(json);
+    ++g_logEvents;
+}
+
+// 建立基线（启动时不回放历史）
+static void CbLogBaseline() {
+    std::string dir = CbLogsDir();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*_*.log").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) { Log("[cblog] no log files in %s", dir.c_str()); return; }
+    do {
+        std::string name = fd.cFileName;
+        std::string full = dir + "\\" + name;
+        HANDLE f = CreateFileA(full.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        LARGE_INTEGER sz;
+        if (GetFileSizeEx(f, &sz)) g_logOffsets[name] = ((unsigned long long)sz.QuadPart) & ~1ULL;
+        CloseHandle(f);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    Log("[cblog] baseline: %d files", (int)g_logOffsets.size());
+}
+
+static void CbLogPump() {
+    std::string dir = CbLogsDir();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*_*.log").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        std::string name = fd.cFileName;
+        std::string full = dir + "\\" + name;
+        unsigned long long from = 0;
+        auto it = g_logOffsets.find(name);
+        if (it != g_logOffsets.end()) from = it->second;
+        from &= ~1ULL;                       // UTF-16 必须偶数对齐
+        std::string chunk;
+        unsigned long long newSize = from;
+        if (!CbReadWhole(full, from, chunk, newSize)) continue;
+        // 注意：不要在这里推进偏移！只有真正提交了行之后才推进，
+        // 否则"没有换行符的末行"会在首个周期被跳过而永久丢失。
+        if (chunk.empty()) continue;
+        // 只处理完整 wchar（偶数长度），且只推进到最后一个换行为止
+        size_t usable = chunk.size() & ~(size_t)1;
+        if (usable < 2) { g_logOffsets[name] = from; continue; }
+        std::string type = name;
+        size_t u = type.find('_');
+        if (u != std::string::npos) type = type.substr(0, u);
+        size_t n = usable / 2;
+        const wchar_t* w = (const wchar_t*)chunk.data();
+        // 先找最后一个 '\n' 的字符下标
+        size_t lastNl = (size_t)-1;
+        for (size_t i = n; i > 0; --i) {
+            if (w[i - 1] == L'\n') { lastNl = i - 1; break; }
+        }
+        if (lastNl == (size_t)-1) {
+            unsigned long long prev2 = g_logLastSize.count(name) ? g_logLastSize[name] : 0;
+            if (prev2 == newSize) { g_logStable[name] = g_logStable[name] + 1; }
+            else { g_logLastSize[name] = newSize; g_logStable[name] = 0; }
+            if (g_logStable[name] >= 2) {
+                std::wstring wtail;
+                for (size_t i = 0; i < n; ++i) {
+                    wchar_t c = w[i];
+                    if (c == L'\n' || c == L'\r') continue;
+                    wtail += c;
+                }
+                std::string tail = CbFixWide(wtail.c_str(), (int)wtail.size());
+                if (tail.empty()) { g_logOffsets[name] = from + (unsigned long long)usable; }
+                else {
+                    CbEmitLogLine(type, name, tail);
+                    g_logOffsets[name] = from + (unsigned long long)usable;
+                }
+            }
+            continue;
+        }
+        std::wstring wline;
+        for (size_t i = 0; i <= lastNl; ++i) {
+            wchar_t c = w[i];
+            if (c == L'\n') {
+                CbEmitLogLine(type, name, CbFixWide(wline.c_str(), (int)wline.size()));
+                wline.clear();
+            } else if (c != L'\r') {
+                wline += c;
+            }
+        }
+        g_logOffsets[name] = from + (unsigned long long)(lastNl + 1) * 2;
+        // 尾部若还有未换行的完整行：文件大小连续 2 个周期不变时提交
+        unsigned long long tailFrom = g_logOffsets[name];
+        size_t tailChars = (usable - (lastNl + 1) * 2) / 2;
+        if (tailChars > 0) {
+            unsigned long long prev = g_logLastSize.count(name) ? g_logLastSize[name] : 0;
+            if (prev == newSize) { g_logStable[name] = g_logStable[name] + 1; }
+            else { g_logLastSize[name] = newSize; g_logStable[name] = 0; }
+            if (g_logStable[name] >= 2) {
+                std::wstring wtail;
+                for (size_t i = lastNl + 1; i < n; ++i) {
+                    wchar_t c = w[i];
+                    if (c == L'\n' || c == L'\r') continue;
+                    wtail += c;
+                }
+                if (!wtail.empty()) CbEmitLogLine(type, name, CbFixWide(wtail.c_str(), (int)wtail.size()));
+                g_logOffsets[name] = tailFrom + (unsigned long long)tailChars * 2;
+            }
+        } else {
+            g_logLastSize[name] = newSize;
+            g_logStable[name] = 0;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static std::string CmdCbLogInfo(const std::vector<std::string>& a) {
+    (void)a;
+    std::string dir = CbLogsDir();
+    std::string prefix = a.size() > 1 ? a[1] : "";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\" + (prefix.empty() ? std::string("*_*.log") : prefix + "_*.log")).c_str(), &fd);
+    std::string out = "{\"ok\":true,\"dir\":\"" + CbJsonEsc(dir) + "\",\"files\":[";
+    if (h != INVALID_HANDLE_VALUE) {
+        int n = 0;
+        do {
+            std::string name = fd.cFileName;
+            unsigned long long real = 0;
+            HANDLE f = CreateFileA((dir + "\\" + name).c_str(), GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER sz;
+                if (GetFileSizeEx(f, &sz)) real = (unsigned long long)sz.QuadPart;
+                CloseHandle(f);
+            } else {
+                continue;
+            }
+            unsigned long long off = 0;
+            auto it = g_logOffsets.find(name);
+            if (it != g_logOffsets.end()) off = it->second;
+            std::string type = name;
+            size_t u = type.find('_');
+            if (u != std::string::npos) type = type.substr(0, u);
+            if (n) out += ",";
+            ++n;
+            out += "{\"name\":\"" + CbJsonEsc(name) + "\",\"type\":\"" + CbJsonEsc(type) +
+                   "\",\"size\":" + std::to_string(real) + ",\"offset\":" + std::to_string(off) +
+                   ",\"lag\":" + std::to_string(real > off ? real - off : 0) + "}";
+            if (n >= 60) break;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    out += "]}";
+    return out;
+}
+
+static void CbLogWorker() {
+    if (g_logOffsets.empty()) CbLogBaseline();
+    for (;;) {
+        if (g_logsEnable) {
+            __try { CbLogPump(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[cblog] pump exception"); }
+        }
+        Sleep(250);
+    }
+}
+
+
+// 聊天事件采集（在 exec 入口调用；ctx=RPC通道, frame=FFrame*）
+static void __cdecl CaptureChat(void* ctx, void* frame) {
+    if (!g_cbEnable) return;
+    if (!ctx || !frame) return;
+    uint8_t* f = (uint8_t*)frame;
+    if (!MemReadable(f + 0x28, 8)) return;
+    uint8_t* locals = *(uint8_t**)(f + 0x28);
+    if (!locals || !MemReadable(locals, 24)) return;
+    const wchar_t* msg = *(const wchar_t**)locals;
+    int32_t msgLen = *(int32_t*)(locals + 8);
+    uint8_t channel = *(uint8_t*)(locals + 16);
+    std::string msgU8;
+    if (msg && msgLen > 1 && msgLen < 2000 && MemReadable(msg, (size_t)msgLen * 2))
+        msgU8 = CbFixWide(msg, msgLen - 1);
+
+    std::string steamId, name, fakeName;
+    // 候选 owner：ctx+0xA0 / ctx+0x20，再扫描 ctx 前 0x200 字节，
+    // 逐个校验 +0x6C8 是否为 17 位数字（SteamID），命中即为控制器
+    void* candidates[40];
+    int nc = 0;
+    for (int k = 0; k < 2; ++k) {
+        uint32_t off = k == 0 ? 0xA0 : 0x20;
+        if (MemReadable((uint8_t*)ctx + off, 8)) {
+            void* v = *(void**)((uint8_t*)ctx + off);
+            if (v) candidates[nc++] = v;
+        }
+    }
+    if (MemReadable(ctx, 0x200)) {
+        for (uint32_t off = 0; off + 8 <= 0x200 && nc < 40; off += 8) {
+            void* v = *(void**)((uint8_t*)ctx + off);
+            if (v) candidates[nc++] = v;
+        }
+    }
+    if (nc > 0) {
+        uint64_t q0 = 0, q1 = 0;
+        for (int k = 0; k < nc && k < 2; ++k) {
+            uint64_t q = 0;
+            if (MemReadable((uint8_t*)candidates[k] + 0x6C8, 8)) q = *(uint64_t*)((uint8_t*)candidates[k] + 0x6C8);
+            if (k == 0) q0 = q; else q1 = q;
+        }
+        Log("[cb] dbg ctx=%p nc=%d c0=%p q0=%p c1=%p q1=%p", ctx, nc, candidates[0], (void*)q0,
+            nc > 1 ? candidates[1] : nullptr, (void*)q1);
+    }
+    for (int i2 = 0; i2 < nc; ++i2) {
+        std::string sid = CbReadFString((uint8_t*)candidates[i2] + 0x6C8);
+        if (sid.size() == 17) {
+            bool digits = true;
+            for (char c : sid) if (!isdigit((unsigned char)c)) digits = false;
+            if (digits) {
+                steamId = sid;
+                name = CbReadFString((uint8_t*)candidates[i2] + 0x6E0);
+                fakeName = CbReadFString((uint8_t*)candidates[i2] + 0x740);
+                if (fakeName.empty()) fakeName = name;
+                break;
+            }
+        }
+    }
+    std::string json = "{\"event\":\"im\",\"steamID\":\"" + CbJsonEsc(steamId) +
+                       "\",\"fackname\":\"" + CbJsonEsc(fakeName) +
+                       "\",\"steamname\":\"" + CbJsonEsc(name) +
+                       "\",\"date\":\"" + CbNowStamp() +
+                       "\",\"data\":{\"channel\":\"" + std::to_string((int)channel) +
+                       "\",\"message\":\"" + CbJsonEsc(msgU8) + "\"}}";
+    CbPush(json);
+    Log("[cb] im ctx=%p cand=%d sid=%s msg=%.60s", ctx, nc, steamId.c_str(), msgU8.c_str());
+}
+
+static bool InstallChatHook() {
+    if (g_chatStub) return true;
+    uintptr_t target = g_rt.moduleBase + 0x28F6070;
+    static const uint8_t pro[5] = { 0x48, 0x89, 0x5C, 0x24, 0x10 };
+    if (!PtrReadable((void*)target, 16)) return false;
+    if (memcmp((void*)target, pro, 5) != 0) { Log("[cb] chat hook prologue mismatch"); return false; }
+
+    const uintptr_t kMaxDist = 0x70000000ULL;
+    uint8_t* tramp = (uint8_t*)AllocExecNear(64, target, kMaxDist);
+    if (!tramp) return false;
+    uint8_t* t = tramp;
+    EmitBytes(t, pro, 5);
+    uint8_t movRax[2] = { 0x48, 0xB8 };
+    EmitBytes(t, movRax, 2);
+    uint64_t cont = target + 5;
+    EmitBytes(t, &cont, 8);
+    uint8_t jmpRax[2] = { 0xFF, 0xE0 };
+    EmitBytes(t, jmpRax, 2);
+    g_chatTramp = tramp;
+
+    uint8_t* stub = (uint8_t*)AllocExecNear(160, target, kMaxDist);
+    if (!stub) return false;
+    uint8_t* s = stub;
+    static const uint8_t sub_38[] = { 0x48, 0x83, 0xEC, 0x38 };
+    static const uint8_t save_rcx[] = { 0x48, 0x89, 0x4C, 0x24, 0x20 };
+    static const uint8_t save_rdx[] = { 0x48, 0x89, 0x54, 0x24, 0x28 };
+    static const uint8_t call_rax[] = { 0xFF, 0xD0 };
+    static const uint8_t rest_rcx[] = { 0x48, 0x8B, 0x4C, 0x24, 0x20 };
+    static const uint8_t rest_rdx[] = { 0x48, 0x8B, 0x54, 0x24, 0x28 };
+    static const uint8_t add_38[] = { 0x48, 0x83, 0xC4, 0x38 };
+    EmitBytes(s, sub_38, sizeof(sub_38));
+    EmitBytes(s, save_rcx, sizeof(save_rcx));
+    EmitBytes(s, save_rdx, sizeof(save_rdx));
+    EmitBytes(s, movRax, 2);
+    uint64_t fnCap = (uint64_t)(uintptr_t)&CaptureChat;
+    EmitBytes(s, &fnCap, 8);
+    EmitBytes(s, call_rax, sizeof(call_rax));
+    EmitBytes(s, rest_rcx, sizeof(rest_rcx));
+    EmitBytes(s, rest_rdx, sizeof(rest_rdx));
+    EmitBytes(s, add_38, sizeof(add_38));
+    EmitBytes(s, pro, 5);
+    EmitBytes(s, movRax, 2);
+    uint64_t tr = (uint64_t)(uintptr_t)tramp;
+    EmitBytes(s, &tr, 8);
+    EmitBytes(s, jmpRax, 2);
+    g_chatStub = stub;
+
+    intptr_t dist = (intptr_t)stub - (intptr_t)(target + 5);
+    if (dist > 0x7FFFFFFFLL || dist < -0x7FFFFFFFLL) { Log("[cb] chat stub out of range"); return false; }
+    DWORD old = 0;
+    if (!VirtualProtect((void*)target, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+    uint8_t patch[5]; patch[0] = 0xE9;
+    int32_t rel = (int32_t)dist;
+    memcpy(patch + 1, &rel, 4);
+    memcpy((void*)target, patch, 5);
+    DWORD tmp = 0;
+    VirtualProtect((void*)target, 5, old, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), (void*)target, 5);
+    Log("[cb] chat hook installed: target=%p stub=%p tramp=%p", (void*)target, stub, tramp);
+    return true;
+}
+
+static std::string CmdCbState(const std::vector<std::string>& a) {
+    (void)a;
+    return "{\"ok\":true,\"enable\":" + std::string(g_cbEnable ? "true" : "false") +
+           ",\"url\":\"" + CbJsonEsc(g_cbUrl) + "\",\"queued\":" + std::to_string((int)g_q.size()) +
+           ",\"sent\":" + std::to_string(g_cbSent) + ",\"fail\":" + std::to_string(g_cbFail) +
+           ",\"dropped\":" + std::to_string(g_cbDropped) +
+           ",\"chatHooked\":" + (g_chatStub ? "true" : "false") + ",\"logEvents\":" + std::to_string(g_logEvents) + "}";
+}
+
+static std::string CmdCbReload(const std::vector<std::string>& a) {
+    (void)a;
+    CbReloadConfig();
+    if (!g_chatStub) InstallChatHook();
+    return CmdCbState(a);
+}
+
+static std::string CmdCbTest(const std::vector<std::string>& a) {
+    std::string msg = a.size() > 1 ? a[1] : "test";
+    std::string json = "{\"event\":\"im\",\"steamID\":\"76561199558480354\",\"fackname\":\"Ac\",\"steamname\":\"Ac\",\"date\":\"" +
+                       CbNowStamp() + "\",\"data\":{\"channel\":\"1\",\"message\":\"" + CbJsonEsc(msg) + "\"}}";
+    CbPush(json);
+    return "{\"ok\":true,\"queued\":" + std::to_string((int)g_q.size()) + "}";
+}
+
 static std::string CmdFindByOuter(const std::vector<std::string>& a) {
     if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: findbyouter <addr> [max]\"}";
     uintptr_t outer = (uintptr_t)strtoull(a[1].c_str(), nullptr, 16);
@@ -1705,6 +2392,10 @@ static std::string HandleLine(const std::string& line) {
     if (cmd == "setadmintarget") return CmdSetAdminTarget(a);
     if (cmd == "installadm") return CmdInstallAdm(a);
     if (cmd == "admstate") return CmdAdmState(a);
+    if (cmd == "cbreload") return CmdCbReload(a);
+    if (cmd == "cbtest") return CmdCbTest(a);
+    if (cmd == "cbstate") return CmdCbState(a);
+    if (cmd == "cbloginfo") return CmdCbLogInfo(a);
     if (cmd == "dumpidx") return CmdDumpIdx(a);
     if (cmd == "gtcall") return CmdGtCall(a);
     if (cmd == "gtcallpe") return CmdGtCallPe(a);
@@ -2221,6 +2912,12 @@ static void LoadAdminTargetAndHook() {
     else Log("[admhook] auto-install FAILED (prologue mismatch?)");
 }
 
+// 单独包一层 SEH（InitWorker 里有 std::thread 等需要展开的对象，不能直接 __try）
+static void LoadAdminGuarded() {
+    __try { LoadAdminTargetAndHook(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[admhook] exception during auto-install"); }
+}
+
 static void InitWorker() {
     unsigned retry = 0;
     while (!g_rt.ready) {
@@ -2230,8 +2927,13 @@ static void InitWorker() {
         if (retry > 300) { Log("[main] init abandoned"); break; }
     }
     if (g_rt.ready) {
-        __try { LoadAdminTargetAndHook(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[admhook] exception during auto-install"); }
+        LoadAdminGuarded();
+        CbReloadConfig();
+        InstallChatHook();
+        std::thread(CbWorker).detach();
+        Log("[cb] worker started");
+        std::thread(CbLogWorker).detach();
+        Log("[cblog] log worker started");
     }
 }
 
@@ -2264,6 +2966,8 @@ static void ServerThread() {
 }
 
 static DWORD WINAPI BootThread(LPVOID) {
+    __try { CbLogBaseline(); }          // 立即建基线，避免漏掉加载期间的登录/聊天
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[cblog] early baseline exception"); }
     ServerThread();
     return 0;
 }

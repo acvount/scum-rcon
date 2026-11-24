@@ -102,13 +102,26 @@ class H:
         return out, fn
 
     def live_channel(self):
-        """当前玩家的通道 = 对象索引最大的非 CDO 通道（最新创建）"""
+        """当前玩家通道：优先 owner 有角色(pawn) 且类名可辨的通道，否则取索引最大者"""
         chs, fn = self.channels()
         if not chs:
             return fn, None, None
-        chs.sort(key=lambda t: t[0])
-        newest = chs[-1]
-        return fn, newest[1], newest[2]
+        scored = []
+        for idx, chan, owner in chs:
+            score = 0
+            try:
+                nm = self.dn(self.rdu32(owner + 0x18))
+                if "PlayerController" in (nm or ""):
+                    score += 2
+                p, _ = self.find_pawn_in(chan)
+                if p:
+                    score += 5
+            except Exception:
+                pass
+            scored.append((score, idx, chan, owner))
+        scored.sort(key=lambda t: (t[0], t[1]))
+        best = scored[-1]
+        return fn, best[2], best[3]
 
     def find_pawn_in(self, chan):
         try:
