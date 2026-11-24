@@ -1,17 +1,20 @@
 # scum-rcon
 
-SCUM Windows 专用服务器的本机控制工具。插件加载到服务端进程后，在 `127.0.0.1:17880` 提供控制接口，Python 客户端可发送聊天、公告和管理员命令；插件同时可以把聊天、登录和游戏日志事件实时回调到本机 HTTP 端点。
+SCUM Windows 专用服务器的本机控制工具。插件加载到服务端进程后，在 `127.0.0.1:17880` 提供行协议控制接口，Python 客户端可发送聊天、公告和管理员命令；插件同时把聊天、登录和游戏日志事件实时回调到本机 HTTP 端点。
 
-这是基于引擎反射与进程内插件的控制工具，不是 SCUM 官方 RCON 协议实现。聊天与公告由服务端对象直接推送，不需要玩家在线；管理员命令借用在线玩家的 RPC 通道执行，需要至少一名在线玩家提供通道，但权限校验对本地工具调用直接放行（不依赖 `AdminUsers.ini`，也不要求该玩家本身是管理员）。客户端脚本会优先选择 owner 带角色的通道，多人在线时不保证一定选中指定玩家。
+这是基于引擎反射与进程内插件的工具，不是 SCUM 官方 RCON 协议实现：
+
+- 聊天、公告直接调用服务端对象的通知/广播函数，**不需要玩家在线**；
+- 管理员命令借用在线玩家的 `PlayerRpcChannel` 执行，需要至少一名在线玩家提供通道，但权限校验对本地工具发起的调用直接放行（不依赖 `AdminUsers.ini`）。
 
 ## 环境要求
 
-- Windows x64，已安装且可以正常运行的 SCUM 专用服务器。
-- Python 3.10 或更高版本。下面的客户端只使用 Python 标准库，无需 `pip install`。
+- Windows x64，已安装且可正常运行的 SCUM 专用服务器。
+- Python 3.10 或更高版本。客户端只用标准库，无需 `pip install`。
 - 从源码编译需要 Visual Studio 2022 Build Tools、C++ x64 工具链、Windows SDK，以及 `cl`、`ml64`、`link`。
-- 插件使用版本相关的引擎布局、偏移和虚表槽位。原资料记录的适配时间为 2026-11-21，不代表兼容之后的所有服务端版本。
+- 插件使用版本相关的引擎布局、偏移（`0x28F6070` 聊天钩子、`0x1F8D8C0` 管理员判定）和虚表槽位。适配记录时间为 2026-11-21，不保证兼容之后的服务端版本。
 
-下面以仓库位于 `D:\scum-rcon`、服务端可执行文件位于 `D:\SCUM_Server\server\SCUM\Binaries\Win64\SCUMServer.exe` 为例，请替换成实际路径。
+以下示例假设仓库在 `D:\scum-rcon`、服务端在 `D:\SCUM_Server\server\SCUM\Binaries\Win64`，请替换为实际路径。
 
 ## 1. 获取与构建
 
@@ -21,29 +24,31 @@ cd /d D:\scum-rcon
 scum-harness\build_all.bat
 ```
 
-`build_all.bat` 默认从以下位置加载 MSVC 环境：
+`build_all.bat` 从以下位置加载 MSVC 环境，路径不同请先修改脚本：
 
 ```text
 C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat
 ```
 
-若安装位置不同，先修改脚本中的路径。请使用 `build_all.bat`，它会一起构建插件、代理 DLL、汇编钩子和注入器；`plugin\build.bat` 是旧构建入口，不作为完整构建方式。
+脚本依次编译汇编钩子、注入型插件、代理 DLL 和注入器，编译参数为 `/std:c++17 /EHa /O2 /MT /utf-8`。成功时依次输出：
 
-构建完成应出现 `PLUGIN_BUILD_OK`、`PROXY_BUILD_OK`、`INJECTOR_BUILD_OK`，并生成：
+```text
+PLUGIN_BUILD_OK
+PROXY_BUILD_OK
+INJECTOR_BUILD_OK
+```
 
-| 文件 | 用途 |
+| 产物 | 用途 |
 | --- | --- |
-| `scum-harness\plugin\dwmapi.dll` | 随服务端启动加载的代理插件，推荐部署方式 |
-| `scum-harness\plugin\scum_harness.dll` | 向已启动进程加载的插件，备用方式 |
+| `scum-harness\plugin\dwmapi.dll` | 代理插件，随服务端启动加载，推荐 |
+| `scum-harness\plugin\scum_harness.dll` | 注入型插件，备用 |
 | `scum-harness\injector\scum_inject.exe` | 备用注入器 |
 
-目录内附带的 DLL/EXE 属于已有构建产物，建议使用与当前源码和目标环境匹配的重新构建结果。
+`plugin\build.bat` 是旧入口，只编译注入型插件，不要用它代替 `build_all.bat`。仓库内附带的 DLL/EXE 是既有构建产物，建议按当前源码与目标版本重新构建。
 
 ## 2. 部署插件
 
-先停止 SCUM 服务端。若服务端目录已有自定义 `dwmapi.dll`，先备份并确认用途，避免直接覆盖。
-
-在 Windows 命令提示符中执行：
+先停服。若目标目录已有自定义 `dwmapi.dll`，先备份并确认用途。
 
 ```bat
 set "SCUM_BIN=D:\SCUM_Server\server\SCUM\Binaries\Win64"
@@ -51,20 +56,22 @@ copy "D:\scum-rcon\scum-harness\plugin\dwmapi.dll" "%SCUM_BIN%\dwmapi.dll"
 copy "%SystemRoot%\System32\dwmapi.dll" "%SCUM_BIN%\dwmapi_orig.dll"
 ```
 
-最终目录如下：
-
 ```text
 SCUM\Binaries\Win64\
 ├── SCUMServer.exe
-├── dwmapi.dll
-└── dwmapi_orig.dll
+├── dwmapi.dll        代理插件（本工具）
+└── dwmapi_orig.dll   系统 DLL 的改名副本，用于转发原有导出
 ```
 
-`dwmapi_orig.dll` 是目标 Windows 系统 DLL 的改名副本，用来转发原有系统调用。它不是构建脚本生成的文件。
+代理按名字 `dwmapi_orig.dll` 加载被代理的系统库；找不到时回退到 `%SystemRoot%\System32\dwmapi.dll`，但同目录留一份 `dwmapi_orig.dll` 更稳妥。`dwmapi_orig.dll` 不是构建产物。
 
-使用原有启动方式启动服务端，等待地图和插件初始化完成。仓库不提供完整服务端安装包，也不包含 `start_server.bat`；可执行文件名以实际安装为准。
+用原有方式启动服务端，等待地图与插件初始化。插件初始化完成后才开始工作，日志写在服务端 exe 同目录的 `scum_harness.log`，应出现：
 
-在服务端所在机器检查连接：
+```text
+[main] control server listening on 127.0.0.1:17880
+```
+
+在服务器本机确认连通：
 
 ```bat
 cd /d D:\scum-rcon
@@ -72,45 +79,41 @@ python scum-harness\client\scumctl.py ping
 python scum-harness\client\scumctl.py stat
 ```
 
-`ping` 返回 `ok: true` 代表控制接口可连接；`stat` 用来检查对象表和名字池等初始化信息。日志位于插件目录下的 `scum_harness.log`。
-
-接口只监听本机回环地址，没有独立认证。Python 客户端应在服务器本机运行。
+`ping` 返回 `{"ok":true,"pong":true}`；`stat` 返回 `ready`、`objects`、`module`、`names`、`gobjects`、`pe_index`，`ready:false` 表示对象表尚未就绪。接口只监听回环地址、无认证，客户端必须在服务器本机运行。
 
 ## 3. 常用操作
 
-以下命令都在仓库根目录执行。包含空格或中文的消息用双引号包住，消息内避免再使用双引号和换行。
+命令都在仓库根目录执行。含空格或中文的参数用双引号包住，参数里避免再出现双引号和换行。
 
-### 聊天广播
+### 3.1 聊天广播（无需玩家在线）
 
 ```bat
 python scum-harness\client\scum_chat.py "大家好，欢迎进入服务器"
 ```
 
-脚本会尝试加载所需类、查找聊天函数和真实 GameMode 实例，再通过游戏线程的 `ProcessEvent` 路径发送消息。
-
-可选参数：
+流程：`tickprobe` 定位游戏线程 → `gtload` 加载 `BP_ConZPlayerController` → 全函数扫描定位 `BroadcastChatLine` → 取带真实世界（outer 为 `PersistentLevel`）的 `BP_ConZGameMode_C` 实例作 WorldContextObject → 在游戏线程 `gtcallpe` 调用 `BroadcastChatLine(WorldContextObject, Text, ChatType)`。全程走服务端对象，零玩家在线也能发送。
 
 | 参数 | 含义 |
 | --- | --- |
-| `--chattype 0` | 指定 ChatType 枚举值，默认 `0`；`2` 为 Global |
-| `--port 17880` | 指定客户端连接端口；不会修改插件的监听端口 |
-| `--ctx 0x地址` | 手动指定 WorldContextObject，通常不需要 |
+| `--chattype N` | ChatType 枚举，默认 `0`；`2` 为 Global |
+| `--port N` | 控制接口端口，默认 `17880` |
+| `--ctx 0x地址` | 手动指定 WorldContextObject；只接受 `0x` 开头的地址，缺省自动查找 GameMode 实例 |
 
-`--reload` 虽然在脚本中接受，但当前实现没有根据它切换行为：每次运行都会尝试加载类，因此无需额外传入。
+`--reload` 参数被解析但当前实现不使用，每次运行都会尝试加载类。脚本输出 `RESULT: SUCCESS` 表示引擎调用已触发且 `ex == 0`，失败时退出码 1；消息是否真的显示，需要在线客户端确认。
 
-`RESULT: SUCCESS` 表示插件报告调用已触发且未返回异常；是否实际显示需在在线游戏客户端确认，零玩家时无法验证消息送达。
-
-### 公告 / 通知（无需玩家在线）
+### 3.2 公告 / 通知（无需玩家在线）
 
 ```bat
 python scum-harness\client\scumctl.py announce "服务器将在十分钟后重启"
 ```
 
-公告由服务端 ChatManager 的 `Multicast_DisplayNotification` / `Multicast_ShowEventNotification` / `NetMulticast_RequestNotification` 直接推送给所有在线客户端，不经过玩家 RPC 通道，零玩家在线也能发送。若改用 `scum_admin.py "Announce ..."`，走的则是下面的管理员命令通道，需要在线玩家。
+控制命令 `announce` 调用服务端 ChatManager 上的通知函数（依次尝试 `Multicast_DisplayNotification`、`Multicast_ShowEventNotification`、`NetMulticast_RequestNotification`、`Client_ShowNotification`），按参数名 `Title`/`NotificationText`/`Text` 与 `Body`/`Message`/`Description` 匹配，不经过玩家 RPC 通道，零玩家在线也能发送。
 
-### 管理员命令（需要在线玩家提供通道）
+注意：`scum_admin.py "Announce ..."` 走的是下面的管理员命令通道，需要在线玩家；两者不是同一条路径。
 
-至少一名玩家在线，用于提供 `PlayerRpcChannel`（权限不再是障碍，见下），然后执行：
+### 3.3 管理员命令（需要在线玩家提供通道）
+
+至少一名玩家在线，用于提供 `PlayerRpcChannel`：
 
 ```bat
 python scum-harness\client\scum_admin.py "Announce 服务器将在十分钟后重启"
@@ -120,51 +123,60 @@ python scum-harness\client\scum_admin.py "Teleport -660000 -270000 12000 PlayerN
 python scum-harness\client\scum_admin.py --list
 ```
 
-- 命令可带或不带开头的 `#`，脚本会自动去掉。
-- `Teleport` 的参数顺序是 `X Y Z [玩家]`，坐标在前，玩家在后；省略玩家时作用于所选通道的玩家。
-- `SpawnItem` 受服务端物品与权限规则约束，并非所有物品都允许生成。
-- `--list` 从当前对象表列出管理员命令类，实际清单取决于服务端版本和已加载对象。
-- 返回 `fired: true`、`ex: 0` 只说明引擎调用完成；业务命令是否获准并生效，仍需查看服务端日志或游戏内结果。
+实现方式是调用玩家通道上的 `Chat_Server_ProcessAdminCommand` 原生 RPC，等价于该玩家在聊天框输入 `#命令`：
 
-权限：插件在管理员判定函数最前面按“调用来源”放行——本地工具（`gtcall`/`gtcallpe`）发起的调用直接返回通过，不再比对 SteamID 或 `AdminUsers.ini`；游戏内玩家手动输入的 `#` 命令仍走原始校验。因此借用的通道不需要属于管理员账号。
+- 命令可带或不带开头的 `#`，脚本会先剥掉（服务端期望不带）。
+- `Teleport` 参数顺序为 `X Y Z [玩家]`，坐标在前；省略玩家时作用于所选通道的玩家。
+- `SpawnItem` 仍受服务端物品与命令自身规则约束，不是所有物品都可生成。
+- `--list` 以 `findclass AdminCommand` 列出当前对象表里的管理员命令类，清单取决于服务端版本与已加载对象。
+- 返回 `{"ok":true,"fired":true,"ex":0,"fn":...,"channel":"0x...","controller":"0x..."}` 只代表引擎调用完成；命令是否获准并生效，以服务端日志的 `Command:` 行或游戏内结果为准。
 
-通道选择：脚本遍历对象表里的 `PlayerRpcChannel`，优先挑选 owner 是 `PlayerController` 且能定位到角色（pawn）的通道，其次才取对象索引最大的通道（玩家重连会留下失效通道，按索引取最大容易选到过期对象）。多人在线时可以先用 `ListPlayers` 确认通道对应的玩家。
-
-相对传送示例：
+相对传送：以通道玩家当前位置为基准，X/Y 加偏移、Z 加 120（引擎单位厘米），可在末尾附加目标玩家名（基准仍是通道玩家）：
 
 ```bat
 python scum-harness\client\scum_admin.py --tp 5000 5000
 ```
 
-脚本以所选通道玩家的当前位置为基准，在 X、Y 上增加指定偏移，在 Z 上增加 120；单位为引擎坐标厘米。可在末尾附加目标玩家名，但基准仍是所选通道玩家的位置。
+**权限**：插件在管理员判定函数（`RVA 0x1F8D8C0`，返回 1 表示是管理员）入口前加了过滤器，本地工具发起的调用（`gtcall`/`gtcallpe` 期间 `g_injectDepth > 0`）直接返回 1，不再比对 SteamID 或 `AdminUsers.ini`；游戏内玩家手打的 `#` 命令仍走原始校验。因此被借用的通道不需要属于管理员账号。
 
-### 可选：指定 SteamID 的管理员钩子
+**通道选择**：脚本遍历对象表里的 `PlayerRpcChannel`，排除 `Default__` 前缀与 `/Script/` 模板对象，再打分——owner 类名含 `PlayerController` 得 2 分、能在通道里定位到带坐标的角色（pawn）得 5 分，取最高分，平手取对象索引最大者。玩家重连会留下失效通道，只按索引取最大容易选到过期对象（症状：`ex=0` 但服务端日志没有 `Command:` 行）。
 
-本地工具发起的命令已按“调用来源”放行，不需要这项配置。插件额外提供的是“指定 SteamID”的进程内管理员判定钩子，用于让某个账号在游戏内输入的 `#` 命令也判定为管理员；使用服务端原有 `AdminUsers.ini` 时，无需开启。
+失败时脚本直接返回错误文本：`Chat_Server_ProcessAdminCommand not found (class not loaded?)` 表示函数不在对象表；`no live PlayerRpcChannel - player offline?` 表示没有可用通道。
 
-如需沿用原工具的指定 SteamID 模式，在插件目录创建 `scum_harness_admin.txt`，内容仅为目标 SteamID，不带 BOM，然后重启服务端。PowerShell 示例：
+### 3.4 可选：指定 SteamID 的管理员钩子
+
+本地工具的命令已按调用来源放行，不需要这项配置。这个钩子用于让某个账号**在游戏内**输入 `#` 命令时也被判定为管理员，适合不改 `AdminUsers.ini` 的场景。
+
+在服务端 exe 同目录创建 `scum_harness_admin.txt`，内容仅为 SteamID，不带 BOM，然后重启服务端（读取时会自动去掉行尾 `\r`/`\n`/空格）：
 
 ```powershell
 [System.IO.File]::WriteAllText('D:\SCUM_Server\server\SCUM\Binaries\Win64\scum_harness_admin.txt', '替换为目标SteamID', [System.Text.Encoding]::ASCII)
 ```
 
-检查安装结果：
+启动后日志应出现：
+
+```text
+[admhook] installed: target=... stub=... tramp=...
+[admhook] auto-installed for <steamid>
+```
+
+检查状态：
 
 ```bat
 python scum-harness\client\scumctl.py admstate
 ```
 
-应检查 `hooked: true`、目标 ID，以及日志中的 `[admhook] installed`、`[admhook] auto-installed`。原资料中的独占验证使用空的 `Saved\Config\WindowsServer\AdminUsers.ini`；已有管理员配置仍可能通过原有权限路径获准，钩子不等于撤销所有其他管理员权限。此钩子同样依赖目标版本偏移。
+返回 `hooked`、`target`、`stub`。钩子靠 `mov [rsp+0x10], rbx`（`48 89 5C 24 10`）识别目标函数，序言不匹配时日志为 `[admhook] auto-install FAILED (prologue mismatch?)`，此时按版本重新适配偏移。
 
-停用自动安装时，先停服，再移走 `scum_harness_admin.txt`，然后重启；仅删除文件不会卸载当前进程已安装的钩子。
+停用：先停服，移走 `scum_harness_admin.txt`，再启动——只删文件不会卸载当前进程里已装好的钩子。已有管理员配置仍可能通过原有权限路径获准，这个钩子不等于撤销其它管理员权限。
 
 ## 4. 实时事件回调（可选）
 
-插件可把聊天、登录/登出和其它游戏日志事件实时 POST 到本机 HTTP 端点，供面板、机器人或群通知使用。不配置该文件时回调保持关闭，其余功能不受影响。
+插件把聊天、登录/登出和游戏日志事件逐条 POST 到本机 HTTP 端点，供面板、机器人、群通知使用。不配置时回调关闭，其余功能不受影响。
 
 ### 4.1 配置
 
-在插件目录（与服务端 exe 同级）创建 `YG_CONFIG.json`：
+在服务端 exe 同目录创建 `YG_CONFIG.json`：
 
 ```json
 {
@@ -173,15 +185,36 @@ python scum-harness\client\scumctl.py admstate
 }
 ```
 
-- `enable`：总开关。
-- `url`：回调地址，当前只支持 `http://`。
-- 修改配置后执行 `python scum-harness\client\scumctl.py cbreload` 即时生效，无需重启服务端。
+- `enable`：控制实时聊天钩子。为 `false` 时钩子照常安装，但采集入口直接返回，不产生钩子聊天事件。
+- `url`：投递地址，必须以 `http://` 开头，格式 `http://host[:port]/path`，缺省端口 80。**只要 `url` 非空，日志事件（`login`/`log`/日志来源的 `im`）与 `cbtest` 合成事件就会投递，与 `enable` 无关**；`url` 为空时事件出队后直接计入 `fail`。
+- 配置文件按普通文件一次读入，缓冲区 4096 字节，保持精简。
+- 改完执行 `scumctl.py cbreload` 即时生效：重读配置，并在未挂钩子时补挂聊天钩子。
+
+投递使用 WinHTTP POST，`Content-Type: application/json; charset=utf-8`、`Connection: close`，HTTP 2xx 视为成功，失败重试一次，仍失败计入 `fail`。
 
 ### 4.2 事件格式
 
-每次投递是一个独立 JSON 对象，按 `event` 字段区分类型。
+每条形如：
 
-**聊天 `im`**
+```json
+{"event":"...","steamID":"...","fackname":"...","steamname":"...","date":"YYYY.MM.DD-HH.MM.SS","data":{...}}
+```
+
+`date` 与游戏日志时间戳同格式。下面按 `event` 说明。
+
+**聊天 `im`（实时钩子）**
+
+```json
+{"event":"im","steamID":"76561199558480354","fackname":"Ac","steamname":"Ac",
+ "date":"2026.11.21-10.29.11",
+ "data":{"channel":"2","message":"你好"}}
+```
+
+- 来自 `Chat_Server_BroadcastChatMessage` 原生实现上的钩子，**没有 `source` 字段**（与日志来源区分）。
+- `channel` 是字符串形式的 `EChatType`：`0` Default、`1` Local、`2` Global、`3` Squad、`4` Admin、`5` CommandsOnly、`6` ServerMessage、`7` Error。
+- 身份字段从通道对象推导：`ctx+0xA0`、`ctx+0x20` 以及 `ctx` 前 `0x200` 字节里最多 40 个候选中，找 `+0x6C8` 为 17 位数字（SteamID）的对象，再读 `+0x6E0` 玩家名、`+0x740` 假名。取不到时这三个字段为空字符串。前几次调用会在日志写 `[cb] dbg ctx=... nc=...` 便于定位。
+
+**聊天 `im`（日志来源）**
 
 ```json
 {"event":"im","steamID":"76561199558480354","fackname":"Ac","steamname":"Ac",
@@ -189,7 +222,7 @@ python scum-harness\client\scumctl.py admstate
  "data":{"channel":"2","message":"你好","source":"log"}}
 ```
 
-`channel` 为 `EChatType`：0/Default、1/Local、2/Global、3/Squad、4/Admin、5/CommandsOnly、6/ServerMessage、7/Error。`source` 区分来源：`hook`（聊天 RPC 实时钩子）或 `log`（聊天日志）。
+来自 `chat_*.log`，多一个 `"source":"log"`。频道名 `Local`/`Global`/`Squad`/`Admin` 会映射成 1/2/3/4；其它频道保留原始名（例如 `"channel":"CommandsOnly"`）。
 
 **登录/登出 `login`**
 
@@ -200,24 +233,27 @@ python scum-harness\client\scumctl.py admstate
          "position":"X=467147.000,Y=-260984.000,Z=14534.000","source":"log"}}
 ```
 
-`action` 为 `login` 或 `logout`。
+来自 `login_*.log`（`admin_*.log` 也先尝试这条路）；`action` 为 `login` 或 `logout`，`position` 里的空格已替换成逗号。
 
 **其它日志 `log`**
 
 ```json
-{"event":"log","type":"loot","date":"2026.11.21-02.51.55",
+{"event":"log","type":"loot","steamID":"","fackname":"","steamname":"",
+ "date":"2026.11.21-02.51.55",
  "data":{"text":"...","file":"loot_20261121025155.log"}}
 ```
 
-`type` 取日志文件名前缀，常见值：`admin`、`chat`、`login`、`loot`、`kill`、`event_kill`、`gameplay`、`economy`、`famepoints`、`quests`、`raid_protection`、`chest_ownership`、`vehicle_destruction`、`server_notifications`、`base_building_destruction`、`violations`、`sentry`、`network_objects`、`armor_absorption`、`nosteam`。
+`type` 取文件名前缀。常见值：`admin`、`chat`、`login`、`loot`、`kill`、`event_kill`、`gameplay`、`economy`、`famepoints`、`quests`、`raid_protection`、`chest_ownership`、`vehicle_destruction`、`server_notifications`、`base_building_destruction`、`violations`、`sentry`、`network_objects`、`armor_absorption`、`nosteam`。
 
-### 4.3 数据来源与限制
+### 4.3 数据来源与实现细节
 
-- 聊天有两条链路：`Chat_Server_BroadcastChatMessage` 原生实现上的实时钩子（RVA 相关，随版本变化），以及 `Saved\SaveFiles\Logs\chat_*.log` 的增量读取。日志泵启动时先建立基线，只推送之后的新增行。
-- 登录和其余事件只来自日志泵，周期约 250ms，属于近实时；单次最多读取 256KB，末行按“文件大小连续两个周期不变”提交。
-- 游戏日志为 UTF-16LE，按类型分文件；中文文本存在双重编码，插件会尝试按 GBK→UTF-8 回滚，失败则保留原文。
-- 事件队列上限 2000 条，超出计入 `dropped`；投递失败重试一次。
-- 只支持明文 `http://`；回调端点需可由服务器本机访问。
+- **实时钩子**：钩 `Chat_Server_BroadcastChatMessage` 原生实现（`RVA 0x28F6070`，序言 `48 89 5C 24 10`）。桩与跳板用 `E9 rel32` 跳转，必须落在目标 ±2GB 内。参数从 `FFrame+0x28 → Locals` 读取：`+0x00` Message（FString）、`+0x08` 长度、`+0x10` Channel（uint8）。序言不匹配时日志写 `[cb] chat hook prologue mismatch`，不装钩子。
+- **日志泵**：目录为服务端 exe 的 `..\..\Saved\SaveFiles\Logs`，文件名为 `<type>_<YYYYMMDDHHMMSS>.log`，编码 UTF-16LE。启动时先建立基线（只记录当前文件大小，不回放历史），之后每 250ms 扫描一次，单次最多读 256KB。
+- **偏移对齐**：读取偏移必须偶数对齐，否则 UTF-16 半字节错位会整段乱码。
+- **末行提交**：只有真正产出了完整行才推进偏移；没有换行的末行要等文件大小连续两个周期不变才提交，否则会永久丢失。
+- **编码修复**：文本里出现 CJK 时按 GBK 回滚成 UTF-8（游戏把 UTF-8 字节当 GBK 解释），失败则保留原文。
+- **队列**：事件入 `std::deque`，长度超过 2000 条时丢弃并计入 `dropped`。
+- **体积**：单条聊天消息长度上限 2000 字符，超长不采集。
 
 ### 4.4 控制命令
 
@@ -228,71 +264,90 @@ python scum-harness\client\scumctl.py cbtest "hello"
 python scum-harness\client\scumctl.py cbloginfo login
 ```
 
-| 命令 | 作用 |
+| 命令 | 返回 |
 | --- | --- |
-| `cbstate` | 显示 enable / url / queued / sent / fail / dropped / logEvents / chatHooked |
-| `cbreload` | 重新读取 `YG_CONFIG.json` 并补挂聊天钩子 |
-| `cbtest "hello"` | 投递一条合成事件，用于验证 HTTP 通路 |
-| `cbloginfo <type>` | 显示某类日志文件的大小、读取偏移和落后字节 |
+| `cbstate` | `enable`、`url`、`queued`、`sent`、`fail`、`dropped`、`chatHooked`、`logEvents` |
+| `cbreload` | 重读 `YG_CONFIG.json`、补挂聊天钩子，返回同上状态 |
+| `cbtest "文本"` | 投递一条合成 `im` 事件，返回当前 `queued` |
+| `cbloginfo <前缀>` | 列出 `<前缀>_*.log` 的 `name`/`type`/`size`/`offset`/`lag`（无参数则列全部，最多 60 个） |
+
+`fail` 持续增长说明端点不可达或返回非 2xx；`dropped` 增长说明积压超过 2000 条。
 
 ### 4.5 本地接收端
 
-仓库带一个最小接收端，用于验证回调是否打通：
-
 ```bat
 python scum-harness\client\scum_cb_recv.py
-python scum-harness\client\scum_cb_recv.py --port 8080 --out events.jsonl
+python scum-harness\client\scum_cb_recv.py --host 127.0.0.1 --port 8080 --out events.jsonl
 ```
 
-它以多线程 HTTP 监听 `127.0.0.1:8080`，每条事件打印到终端并追加到 `--out` 指定文件（默认 `events.jsonl`）。终端需 `chcp 65001` 与 `PYTHONIOENCODING=utf-8`，否则中文显示为乱码（落盘文件本身是 UTF-8）。
+多线程 HTTP 服务，每条事件打印到终端并追加一行到 `--out`（默认 `events.jsonl`，UTF-8）。终端需 `chcp 65001` 与 `PYTHONIOENCODING=utf-8` 才能正确显示中文，落盘文件本身是 UTF-8。
 
 ## 5. 备用加载方式
 
-如果不采用启动代理，可对已运行的服务端使用注入器。以具备目标进程访问权限的身份执行，DLL 必须使用绝对路径：
+不用启动代理时，可对已运行的服务端注入。以具备目标进程访问权限的身份执行，DLL 用绝对路径：
 
 ```bat
 D:\scum-rcon\scum-harness\injector\scum_inject.exe SCUMServer.exe D:\scum-rcon\scum-harness\plugin\scum_harness.dll
 ```
 
-第一个参数也可使用 PID。代理加载与注入选择一种即可，避免重复加载。注入后同样用 `ping`、`stat` 检查。
+第一个参数可以是进程名或 PID。代理加载与注入二选一，不要重复加载。注入后同样用 `ping`、`stat` 验证。
 
-## 6. 故障排查
+## 6. 控制接口命令速查
+
+接口是行协议：一次连接发一行命令（参数用空格分隔，含空格的参数加双引号），返回一行 JSON。`scumctl.py` 只是把参数原样拼成这一行，所以 `python scumctl.py cbstate` 等价于发送 `cbstate`。
+
+| 命令 | 作用 |
+| --- | --- |
+| `ping` | 连通性检查 |
+| `stat` | 模块基址、对象表/名字池地址、对象数、`ready` |
+| `announce <文本>` | 服务端公告/通知，无需玩家 |
+| `chat <发送者> <SteamID> <文本>` | 直接走聊天管理器广播 |
+| `classes [N]` | 按类名统计对象数量 |
+| `funcs [关键字]` | 搜索 UFunction 名 |
+| `desc <函数名>` | 列出参数名/偏移/大小 |
+| `gtcallpe <函数名或0x地址> [ctx] [参数...]` | 在游戏线程经 `ProcessEvent` 调用 |
+| `cbstate` / `cbreload` / `cbtest` / `cbloginfo` | 见 4.4 |
+| `admstate` | 管理员钩子状态 |
+
+更多诊断命令（`gtload`、`tickprobe`、`dumpfuncsraw`、`findinst`、`writemem` 等）保留在源码里，属于逆向调试用途，日常不需要。
+
+## 7. 故障排查
 
 | 现象 | 检查方式 |
 | --- | --- |
-| 连接被拒绝或超时 | 确认服务端运行、DLL 位于正确可执行文件目录、日志出现 `control server listening`；客户端必须在服务器本机运行 |
-| `stat` 尚未就绪 | 等待地图和对象表初始化，检查 `scum_harness.log` 中的初始化失败或重试信息 |
-| `no live PlayerRpcChannel` | 让玩家进入服务器；只有管理员命令需要在线玩家通道，公告与聊天广播不需要 |
-| 命令被拒绝或无效果 | 检查所选通道玩家的管理员权限、命令参数，以及服务端日志；多人在线时先 `ListPlayers` 确认通道 |
-| 找不到 `BroadcastChatLine` | 等待地图加载或让真实客户端连接以加载所需类，再重试；检查是否为版本不兼容 |
-| 加载类失败，但聊天函数存在 | 脚本会继续尝试发送，以最终调用结果及游戏内显示为准 |
-| `ex` 非零或升级后崩溃 | 停用插件并核对版本适配；不要沿用旧构建的地址、偏移或虚表槽位 |
-| 编译找不到 `cl` / `ml64` | 确认安装 C++ x64 工具链，并修正 `build_all.bat` 中的 MSVC 环境路径 |
-| 中文显示异常 | 检查终端编码及游戏内结果；命令和控制协议使用 UTF-8 |
-| `cbstate` 显示 `chatHooked:false` | 聊天钩子未挂上：确认服务端版本匹配、执行 `cbreload`，并查看日志中的 `[cb] chat hook installed` |
-| 收不到任何事件 | 确认 `YG_CONFIG.json` 的 `enable` 与 `url`、接收端在监听、`sent` 计数是否增长；`fail` 增长说明端点不可达 |
+| 连接被拒绝或超时 | 服务端是否运行、DLL 是否在 exe 同目录、日志是否有 `control server listening`；客户端必须在服务器本机 |
+| `stat` 的 `ready:false` | 等地图与对象表初始化；看 `scum_harness.log` 里 `[main] init retry` |
+| 公告没有反应 | `announce` 返回 `ok:false` 时看 `error`（通常是 `manager not found` 或函数名不匹配） |
+| 聊天脚本报 `BroadcastChatLine 不在对象表` | 类未加载或被 GC：让真实客户端连一次，或检查版本兼容 |
+| `no live PlayerRpcChannel - player offline?` | 管理员命令需要在线玩家通道；公告与聊天广播不需要 |
+| `Chat_Server_ProcessAdminCommand not found` | 函数不在对象表，通常是对应类未加载 |
+| 管理员命令 `ex=0` 但没生效 | 看服务端日志有没有 `Command:` 行；没有说明选到了过期通道，重启客户端脚本重选 |
+| 命令被拒绝 | 检查命令参数与服务端规则；本地调用已跳过管理员名单校验，游戏内手打命令仍受 `AdminUsers.ini` 约束 |
+| `ex` 非零或升级后崩溃 | 停用插件并重新适配偏移；不要沿用旧构建的地址与虚表槽位 |
+| 编译找不到 `cl` / `ml64` | 装 C++ x64 工具链并修正 `build_all.bat` 里的 vcvars 路径 |
+| 中文显示异常 | 终端编码与游戏内结果一起看；控制协议与事件均为 UTF-8 |
+| `cbstate` 里 `chatHooked:false` | 序言不匹配或版本不符，看日志 `[cb] chat hook prologue mismatch`；执行 `cbreload` 重试 |
+| 收不到任何事件 | 核对 `YG_CONFIG.json` 的 `enable`/`url`、接收端是否在监听、`sent` 是否增长 |
 | 只有 `login`/`log` 没有 `im` | 聊天钩子依赖版本偏移；日志链路仍会产出 `source:log` 的聊天事件 |
-| 事件重复或串码 | 日志泵按文件增量读取，重启或回滚日志文件会重放；中文已做 GBK 回滚，仍有异常时以游戏内文本为准 |
+| `cbloginfo` 里 `lag` 一直增长 | 日志泵读取落后：检查是否有大量写入、单次 256KB 上限是否长期打满 |
 
-升级或卸载插件时先停服，再替换或移走插件文件；若曾备份原有自定义 DLL，应恢复备份。
+升级或卸载：先停服，再替换或移走插件文件；曾备份过自定义 DLL 的应恢复备份。
 
-## 7. 文件说明
+## 8. 文件说明
 
 ```text
 scum-rcon/
 ├── README.md                  使用说明
 ├── scum-harness/
 │   ├── build_all.bat          完整构建入口
-│   ├── plugin/                C++ 插件、汇编、导出定义及已有构建产物
+│   ├── plugin/                C++ 插件、汇编钩子、代理 DLL 及已有构建产物
 │   ├── injector/              注入器源码及已有构建产物
-│   └── client/                Python 控制客户端与事件接收端
+│   └── client/                Python 客户端：scumctl / scum_chat / scum_admin / scum_cb_recv
 ├── scripts/scum_status.py     旧安装环境巡检脚本
 ├── Find-SCUM-Server.ps1        查找服务端的辅助脚本
-└── .re/                       逆向研究脚本及数据，日常使用不需要
+└── .re/                       逆向研究脚本与数据，日常使用不需要
 ```
 
-日常使用只需完整构建入口、部署 DLL 和客户端脚本：`scumctl.py`（控制接口与回调命令）、`scum_chat.py`（聊天广播）、`scum_admin.py`（管理员命令）、`scum_cb_recv.py`（事件接收端）。
+日常只需 `build_all.bat`、部署的 DLL 和四个客户端脚本。`YG_CONFIG.json`、`scum_harness_admin.txt`、`scum_harness.log` 均在服务端目录按需生成，不随仓库分发。
 
-`YG_CONFIG.json`、`scum_harness_admin.txt`、`scum_harness.log` 均在服务端插件目录按需生成，不随仓库分发。
-
-其余探测和研究脚本保留原样，可能含原机器路径或旧版本假设，不属于安装步骤。特别是 `scripts/scum_status.py` 仍按旧的 `SCUMServer-Win64-Shipping.exe` 文件名检查，不能用它的结果代替当前服务端的实际启动验证。
+`client/` 下的 `probe_*.py`、`send_announce.py`、`verify_utf8.py` 是开发期验证脚本，可能含原机器路径或旧版本假设，不属于安装与日常使用步骤。`scripts/scum_status.py` 仍按旧的 `SCUMServer-Win64-Shipping.exe` 文件名检查，其结果不能替代对当前服务端的实际启动验证。
