@@ -1,0 +1,2226 @@
+﻿// dllmain.cpp 鈥?inject entry + local control server (127.0.0.1:17880, line protocol)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include "ue.h"
+#include <thread>
+#include <sstream>
+#include <algorithm>
+#include <vector>
+#include <map>
+#include <functional>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <ctype.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+using namespace ue;
+
+static const int kPort = 17880;
+
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+static std::string JsonEscape(const std::string& s) {
+    std::string o;
+    for (char c : s) {
+        if (c == '"') o += "\\\"";
+        else if (c == '\\') o += "\\\\";
+        else if ((unsigned char)c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+        else o += c;
+    }
+    return o;
+}
+static std::vector<std::string> SplitArgs(const std::string& line) {
+    std::vector<std::string> out;
+    std::string cur;
+    bool inq = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+        if (c == '"') { inq = !inq; continue; }
+        if (!inq && (c == ' ' || c == '\t')) {
+            if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+            continue;
+        }
+        cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+static std::string Lower(std::string s) {
+    for (auto& c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
+
+static std::string CmdStat() {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"ready\":%s,\"objects\":%d,\"module\":\"0x%llx\",\"names\":\"0x%llx\",\"gobjects\":\"0x%llx\",\"pe_index\":%d}",
+             g_rt.ready ? "true" : "false", NumObjects(),
+             (unsigned long long)g_rt.moduleBase, (unsigned long long)g_rt.names,
+             (unsigned long long)g_rt.objects, g_rt.processEventIndex);
+    return buf;
+}
+
+static std::string CmdProbe(const std::vector<std::string>& a) {
+    int n = a.size() > 1 ? atoi(a[1].c_str()) : 20;
+    if (n <= 0 || n > 500) n = 20;
+    std::string out = "{\"ok\":true,\"items\":[";
+    int found = 0;
+    for (int i = 0; i < n && i < NumObjects(); ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (found) out += ",";
+        ++found;
+        out += "{\"i\":" + std::to_string(i) +
+               ",\"name\":\"" + JsonEscape(GetObjectNameFast(o)) + "\"" +
+               ",\"class\":\"" + JsonEscape(GetClassNameFast(o)) + "\"}";
+    }
+    out += "]}";
+    return out;
+}
+
+static std::string CmdClasses(const std::vector<std::string>& a) {
+    std::map<std::string, int> counts;
+    int n = NumObjects();
+    char cls[256];
+    for (int i = 0; i < n; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (!TryClassName(o, cls, sizeof(cls)) || !cls[0]) continue;
+        counts[cls]++;
+    }
+    std::vector<std::pair<int, std::string>> ranked;
+    for (auto& kv : counts) ranked.push_back({ kv.second, kv.first });
+    std::sort(ranked.begin(), ranked.end(), [](auto& x, auto& y) { return x.first > y.first; });
+    size_t limit = a.size() > 1 ? (size_t)atoi(a[1].c_str()) : 60;
+    if (limit == 0 || limit > 3000) limit = 60;
+    std::string out = "{\"ok\":true,\"total_classes\":" + std::to_string(counts.size()) + ",\"classes\":[";
+    size_t k = 0;
+    for (auto& r : ranked) {
+        if (k++ >= limit) break;
+        if (k > 1) out += ",";
+        out += "{\"name\":\"" + JsonEscape(r.second) + "\",\"count\":" + std::to_string(r.first) + "}";
+    }
+    out += "]}";
+    return out;
+}
+
+static std::string CmdFindFuncs(const std::vector<std::string>& a) {
+    std::string needle = a.size() > 1 ? Lower(a[1]) : "";
+    std::string out = "{\"ok\":true,\"functions\":[";
+    bool first = true;
+    int matched = 0;
+    int n = NumObjects();
+    char cls[256], nmBuf[512];
+    for (int i = 0; i < n; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Function") != 0) continue;
+        if (!TryObjectName(o, nmBuf, sizeof(nmBuf))) continue;
+        std::string nm = nmBuf;
+        if (nm.empty()) continue;
+        if (!needle.empty() && Lower(nm).find(needle) == std::string::npos) continue;
+        if (!first) out += ",";
+        first = false;
+        out += "\"" + JsonEscape(nm) + "\"";
+        if (++matched >= 400) break;
+    }
+    out += "],\"matched\":" + std::to_string(matched) + "}";
+    return out;
+}
+
+static std::string CmdDesc(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: desc <FunctionName>\"}";
+    UFunction* fn = FindFunction(a[1]);
+    if (!fn) return "{\"ok\":false,\"error\":\"function not found\"}";
+    FunctionInfo info;
+    DescribeFunction(fn, info);
+    std::string out = "{\"ok\":true,\"name\":\"" + JsonEscape(info.fullName) +
+                      "\",\"parmsSize\":" + std::to_string(info.parmsSize) + ",\"params\":[";
+    bool first = true;
+    for (auto& p : info.params) {
+        if (!first) out += ",";
+        first = false;
+        out += "{\"name\":\"" + JsonEscape(p.name) + "\",\"offset\":" + std::to_string(p.offset) +
+               ",\"size\":" + std::to_string(p.size) + "}";
+    }
+    out += "]}";
+    return out;
+}
+
+static std::string CmdChat(const std::vector<std::string>& a) {
+    if (a.size() < 4) return "{\"ok\":false,\"error\":\"usage: chat <sender> <steamid> <text>\"}";
+    std::string text = a[3];
+    for (size_t i = 4; i < a.size(); ++i) text += " " + a[i];
+    std::string err;
+    if (!BroadcastChat(Utf8ToWide(a[1]), Utf8ToWide(text), 0, Utf8ToWide(a[2]), "Global", &err))
+        return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+    return "{\"ok\":true}";
+}
+
+static std::string CmdAnnounce(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: announce <text>\"}";
+    std::string text = a[1];
+    for (size_t i = 2; i < a.size(); ++i) text += " " + a[i];
+    std::string err;
+    if (!SendAnnouncement(L"Server", Utf8ToWide(text), &err))
+        return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+    return "{\"ok\":true}";
+}
+
+static std::string CmdGive(const std::vector<std::string>& a) {
+    if (a.size() < 4) return "{\"ok\":false,\"error\":\"usage: give <player> <itemclass> <amount>\"}";
+    std::string err;
+    if (!GiveItem(Utf8ToWide(a[1]), Utf8ToWide(a[2]), atoi(a[3].c_str()), &err))
+        return "{\"ok\":false,\"error\":\"" + JsonEscape(err) + "\"}";
+    return "{\"ok\":true}";
+}
+
+static bool InitGuarded() {
+    __try {
+        return Init(nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[main] init raised an exception");
+        return false;
+    }
+}
+
+static int PeInvokeInvokeNative(uintptr_t funcAddr, UObject* obj, void* frame, void* retVal) {
+    __try {
+        ((void(*)(UObject*, void*, void*))funcAddr)(obj, frame, retVal);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return (int)GetExceptionCode();
+    }
+}
+
+static int PeInvokeInvoke(uintptr_t invokeAddr, UFunction* fn, UObject* obj, void* frame, void* retVal) {
+    __try {
+        ((void(*)(UFunction*, UObject*, void*, void*))invokeAddr)(fn, obj, frame, retVal);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return (int)GetExceptionCode();
+    }
+}
+
+static int PeInvokeCallspace(uintptr_t fnAddr, UObject* obj, UFunction* fn, int* out) {
+    __try {
+        int v = ((int(*)(UObject*, UFunction*, void*))fnAddr)(obj, fn, nullptr);
+        *out = v;
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return (int)GetExceptionCode();
+    }
+}
+
+static int PeInvokeFunc(uintptr_t fnAddr, UObject* obj, void* frame, void* result) {
+    __try {
+        ((void(*)(UObject*, void*, void*))fnAddr)(obj, frame, result);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return (int)GetExceptionCode();
+    }
+}
+
+static int PeInvokeRaw(uintptr_t fnAddr, UObject* obj, UFunction* fn, void* parms) {
+    __try {
+        ((void(*)(UObject*, UFunction*, void*))fnAddr)(obj, fn, parms);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return (int)GetExceptionCode();
+    }
+}
+
+static int CallNativeFn(UFunction* fn, UObject* obj, uint8_t* parms, uint16_t psz, uint16_t roff, void* retPtr) {
+    // 娉ㄦ剰锛氫笉鍋?PtrReadable 棰勬鏌ワ紙g_ranges 鍙兘闄堟棫锛夛紱璋冪敤鏂瑰繀椤荤敤 SEH 鍖呰９
+    if (!fn) return -1;
+    uint64_t nf = *(uint64_t*)((uint8_t*)fn + 0xD8);
+    if (!nf) return -1;
+    uint8_t* frame = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 512);
+    if (!frame) return -1;
+    // 灞炴€ч摼锛氬彇 Offset_Internal(0x4C)==0 鐨勫弬鏁板睘鎬э紙璺宠繃杩斿洖鍊煎睘鎬э級
+    uint64_t chain = *(uint64_t*)((uint8_t*)fn + 0x50);
+    uint64_t prop = chain;
+    for (int k = 0; k < 6 && prop; ++k) {
+        if (*(uint32_t*)((uint8_t*)prop + 0x4C) == 0) break;      // 鍙傛暟灞炴€у懡涓?        prop = *(uint64_t*)((uint8_t*)prop + 0x20);
+    }
+    if (!prop) prop = chain;
+    // 鍚堟垚 Code 瀛楄妭鐮佹祦锛氭瘡涓緭鍏ュ弬鏁颁竴鏉?{EX_LocalVariable(0x00), FProperty*}
+    //锛堣烦杩囪繑鍥炲€煎睘鎬э細CPF_ReturnParm = 0x40000000锛?    uint8_t codebuf[256] = {0};
+    size_t clen = 0;
+    uint64_t p2 = chain;
+    for (int k = 0; k < 16 && p2 && clen < 240; ++k) {
+        uint32_t fl2 = *(uint32_t*)((uint8_t*)p2 + 0x40);
+        if (fl2 & 0x40000000u) { p2 = *(uint64_t*)((uint8_t*)p2 + 0x20); continue; }
+        codebuf[clen] = 0x00;
+        *(uint64_t*)(codebuf + clen + 1) = p2;
+        clen += 9;
+        p2 = *(uint64_t*)((uint8_t*)p2 + 0x20);
+    }
+    *(uint64_t*)(frame + 0x00) = (uint64_t)(g_rt.moduleBase + 0x6345A58);
+    *(uint16_t*)(frame + 0x08) = 0x100;
+    *(uint64_t*)(frame + 0x10) = (uint64_t)fn;
+    *(uint64_t*)(frame + 0x18) = (uint64_t)obj;
+    *(uint64_t*)(frame + 0x20) = (uint64_t)codebuf;       // Code 鈫?鏍囧噯 Step 璺緞
+    *(uint64_t*)(frame + 0x28) = (uint64_t)parms;
+    *(uint64_t*)(frame + 0x80) = prop;                    // PropertyChainForCompiledIn
+    *(uint64_t*)(frame + 0x88) = (uint64_t)fn;            // CurrentNativeFunction
+    int ex = PeInvokeInvokeNative(nf, obj, frame, retPtr);
+    HeapFree(GetProcessHeap(), 0, frame);
+    return ex;
+}
+
+// ---- GameThread dispatch via ProcessEvent hook ----
+static bool g_peHooked = false;
+static bool g_useGameThreadHook = false;
+static bool InstallProcessEventHook();
+
+// Zero-allocation task slot: hook callback must not allocate or throw.
+struct GtTask {
+    volatile LONG state;      // 0 idle, 1 pending, 2 running, 3 done
+    void* ctx;
+    int (*fn)(void*);
+    int result;
+};
+static GtTask g_gt = {0, nullptr, nullptr, -1};
+
+static int SafeRunGtTask() {
+    __try {
+        return g_gt.fn ? g_gt.fn(g_gt.ctx) : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1000 - (int)GetExceptionCode();
+    }
+}
+
+static bool SubmitGtTask(void* ctx, int (*fn)(void*), int timeoutMs) {
+    if (!g_peHooked && !InstallProcessEventHook()) return false;
+    g_gt.ctx = ctx;
+    g_gt.fn = fn;
+    g_gt.result = -1;
+    InterlockedExchange(&g_gt.state, 1);
+    for (int i = 0; i < timeoutMs; ++i) {
+        if (InterlockedCompareExchange(&g_gt.state, 3, 3) == 3) return true;
+        Sleep(1);
+    }
+    InterlockedExchange(&g_gt.state, 0);
+    return false;
+}
+static uintptr_t g_peAddr = 0;
+static uint8_t g_peSaved[16] = {0};
+// g_peHooked / g_useGameThreadHook are declared above the task slot.
+
+
+typedef void (*PeFn)(UObject*, UFunction*, void*);
+static PeFn g_peTrampoline = nullptr;
+
+static void PeHook(UObject* obj, UFunction* fn, void* parms) {
+    if (InterlockedCompareExchange(&g_gt.state, 1, 1) == 1) {
+        InterlockedExchange(&g_gt.state, 2);       // mark running (blocks re-entry)
+        g_gt.result = SafeRunGtTask();
+        InterlockedExchange(&g_gt.state, 3);       // done
+    }
+    g_peTrampoline(obj, fn, parms);
+}
+
+static bool InstallProcessEventHook() {
+    if (g_peHooked) return true;
+    g_peAddr = g_rt.moduleBase + 0x2E261D0;
+    if (!PtrReadable((void*)g_peAddr, 16)) return false;
+    // Prologue is 7 pushes + "sub rsp,0xf0" = exactly 14 bytes.
+    const int kPatch = 14;
+    memcpy(g_peSaved, (void*)g_peAddr, kPatch);
+    uint8_t* tramp = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tramp) return false;
+    memcpy(tramp, g_peSaved, kPatch);
+    tramp[kPatch] = 0xFF; tramp[kPatch + 1] = 0x25;
+    *(uint32_t*)(tramp + kPatch + 2) = 0;
+    *(uint64_t*)(tramp + kPatch + 6) = (uint64_t)(g_peAddr + kPatch);
+    g_peTrampoline = (PeFn)tramp;
+    DWORD old = 0;
+    if (!VirtualProtect((void*)g_peAddr, kPatch, PAGE_EXECUTE_READWRITE, &old)) return false;
+    uint8_t patch[16] = {0};
+    patch[0] = 0xFF; patch[1] = 0x25;
+    *(uint32_t*)(patch + 2) = 0;
+    *(uint64_t*)(patch + 6) = (uint64_t)&PeHook;
+    memcpy((void*)g_peAddr, patch, kPatch);
+    VirtualProtect((void*)g_peAddr, kPatch, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)g_peAddr, kPatch);
+    g_peHooked = true;
+    Log("[hook] ProcessEvent hooked at %p", (void*)g_peAddr);
+    return true;
+}
+
+// ---------------- UEngine::Tick 娓告垙绾跨▼ hook锛坴thooks.asm锛?----------------
+// 璁捐锛歨ook 姘镐箙椹荤暀锛坧ass-through锛夛紝state 鏍囧織姝﹁/瑙ｉ櫎锛屾棤瀛楄妭鎭㈠绔炴€併€?// 姣忎釜 hook 鐐逛竴涓嫭绔?stub锛圡akeStub 鐢熸垚锛夋惡甯﹁褰曟寚閽堬紝鏍稿績鍏变韩銆?struct ProbeRec {
+    volatile LONG state;   // @0
+    LONG pad0;             // @4
+    LONG count;            // @8
+    LONG padA;             // @12
+    LONG nDelta;           // @16
+    float deltas[8];       // @20..@51
+    LONG pad1;             // @52
+    LONG nRdx;             // @56
+    LONG rdxs[8];          // @60..@91
+    LONG pad2;             // @92
+    LONG nTid;             // @96
+    DWORD tids[4];         // @100..@115
+    LONG pad3;             // @116
+    uintptr_t trampoline;  // @120 (0x78)
+    uintptr_t stub;        // @128
+};
+static_assert(offsetof(ProbeRec, count) == 0x08, "ProbeRec.count");
+static_assert(offsetof(ProbeRec, nDelta) == 0x10, "ProbeRec.nDelta");
+static_assert(offsetof(ProbeRec, deltas) == 0x14, "ProbeRec.deltas");
+static_assert(offsetof(ProbeRec, nRdx) == 0x38, "ProbeRec.nRdx");
+static_assert(offsetof(ProbeRec, rdxs) == 0x3C, "ProbeRec.rdxs");
+static_assert(offsetof(ProbeRec, nTid) == 0x60, "ProbeRec.nTid");
+static_assert(offsetof(ProbeRec, tids) == 0x64, "ProbeRec.tids");
+static_assert(offsetof(ProbeRec, trampoline) == 0x78, "ProbeRec.trampoline");
+struct LoadRec {
+    volatile LONG state;   // @0  0=armed-idle 1=running 2=done
+    LONG pad;              // @4
+    void* ctx;             // @8
+    DWORD expectedTid;     // @16
+    LONG result;           // @20
+    uint64_t classPtr;     // @24
+    uintptr_t trampoline;  // @0x20
+    uintptr_t stub;        // @0x28
+};
+static_assert(offsetof(LoadRec, ctx) == 0x08, "LoadRec.ctx");
+static_assert(offsetof(LoadRec, expectedTid) == 0x10, "LoadRec.expectedTid");
+static_assert(offsetof(LoadRec, result) == 0x14, "LoadRec.result");
+static_assert(offsetof(LoadRec, classPtr) == 0x18, "LoadRec.classPtr");
+static_assert(offsetof(LoadRec, trampoline) == 0x20, "LoadRec.trampoline");
+extern "C" void ProbeHookCore();
+extern "C" void LoadHookCore();
+extern "C" void LoadTaskInvokeC();
+
+static ProbeRec g_probeRecs[64];
+static uintptr_t g_probeTargets[64];
+static int g_probeCount = 0;
+static LoadRec g_loadRec = {};
+static uintptr_t g_loadTarget = 0;
+
+static uint8_t* MakeStub(uintptr_t coreFn, void* recPtr) {
+    uint8_t* s = (uint8_t*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!s) return nullptr;
+    s[0] = 0x48; s[1] = 0xB8; *(uint64_t*)(s + 2) = (uint64_t)recPtr;    // mov rax, rec
+    s[10] = 0x49; s[11] = 0xBB; *(uint64_t*)(s + 12) = coreFn;           // mov r11, core
+    s[20] = 0x41; s[21] = 0xFF; s[22] = 0xE3;                           // jmp r11
+    return s;
+}
+
+static UObject* FindClassObject(const char* clsName) {
+    int n = NumObjects();
+    char nm[512], cls[256];
+    for (int i = 0; i < n; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+        if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, clsName) != 0) continue;
+        return o;
+    }
+    return nullptr;
+}
+
+static UObject* FindCdo(const char* clsName) {
+    UObject* uclass = FindClassObject(clsName);
+    if (!uclass) return nullptr;
+    uint64_t cdoPtr = 0;
+    if (PtrReadable((uint8_t*)uclass + 0x118, 8)) cdoPtr = *(uint64_t*)((uint8_t*)uclass + 0x118);
+    if (cdoPtr && PtrReadable((void*)cdoPtr, 0x28)) return (UObject*)cdoPtr;
+    return nullptr;
+}
+
+static uintptr_t GetVtSlot(const char* clsName, int slot) {
+    UObject* cdo = FindCdo(clsName);
+    if (!cdo) return 0;
+    void** vt = *(void***)cdo;
+    if (!vt || !PtrReadable(vt + slot, 8)) return 0;
+    return (uintptr_t)vt[slot];
+}
+
+static bool InstallPatch(uintptr_t target, size_t n, void* hook, uintptr_t* trampOut, uintptr_t* targetOut) {
+    if (!target || !hook || !trampOut || !PtrReadable((void*)target, n)) return false;
+    if (n < 14 || n > 32) return false;
+    uint8_t* tramp = (uint8_t*)VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tramp) return false;
+    memcpy(tramp, (void*)target, n);
+    tramp[n + 0] = 0xFF; tramp[n + 1] = 0x25;
+    *(uint32_t*)(tramp + n + 2) = 0;
+    *(uint64_t*)(tramp + n + 6) = target + n;
+    DWORD old = 0;
+    if (!VirtualProtect((void*)target, n, PAGE_EXECUTE_READWRITE, &old)) return false;
+    uint8_t patch[32] = {0};
+    memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0xFF; patch[1] = 0x25;
+    *(uint32_t*)(patch + 2) = 0;
+    *(uint64_t*)(patch + 6) = (uint64_t)hook;
+    memcpy((void*)target, patch, n);
+    VirtualProtect((void*)target, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)target, n);
+    *trampOut = (uintptr_t)tramp;
+    if (targetOut) *targetOut = target;
+    Log("[vt] patched %p (n=%zu) hook=%p", (void*)target, n, hook);
+    return true;
+}
+
+
+
+struct LoadBpCtx {
+    UObject* lib;
+    UFunction* f1;
+    UFunction* f3;
+    uint8_t* p1;
+    uint8_t* p3;
+    uint32_t registered;
+    int e1;
+    int e3;
+    uint64_t got;
+};
+static LoadBpCtx g_lbCtx = {};
+
+static int LoadBpTaskFn(void* v) {
+    LoadBpCtx* c = (LoadBpCtx*)v;
+    c->e1 = CallNativeFn(c->f1, c->lib, c->p1, 40, 0x10, c->p1 + 0x10);
+    memcpy(&c->registered, c->p1 + 0x10, 4);
+    // TSoftClassPtr: +0 FWeakObjectPtr, +8 FSoftObjectPath{FName, FString}
+    *(int32_t*)(c->p3 + 8) = (int32_t)c->registered;
+    *(uint32_t*)(c->p3 + 12) = 0;
+    c->e3 = CallNativeFn(c->f3, c->lib, c->p3, 48, 0x28, c->p3 + 0x28);
+    if (PtrReadable(c->p3 + 0x28, 8)) c->got = *(uint64_t*)(c->p3 + 0x28);
+    return 0;
+}
+
+// 鐢?vthooks.asm 鐨?LoadHook 鍦ㄦ父鎴忕嚎绋嬶紙UEngine::Tick 鍏ュ彛锛夎皟鐢?static volatile LONG g_gtCapture = 0;
+static ULONG_PTR g_gtIp = 0, g_gtAddr = 0;
+static LONG CALLBACK GtVeh(EXCEPTION_POINTERS* ep) {
+    if (!g_gtCapture) return EXCEPTION_CONTINUE_SEARCH;
+    g_gtIp = 0; g_gtAddr = 0;
+    if (ep && ep->ExceptionRecord) {
+        g_gtIp = (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
+        if (ep->ExceptionRecord->NumberParameters >= 2)
+            g_gtAddr = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1];
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+struct GtCallCtx {
+    UFunction* fn = nullptr;
+    UObject* ctx = nullptr;
+    uint8_t* parms = nullptr;
+    int psz = 0;
+    uint16_t retOff = 0;
+    void* retPtr = nullptr;
+    char fnName[128] = {0};
+    int ex = 0;
+    int usePE = 0;      // 1 = 璧板紩鎿?ProcessEvent锛堢湡瀹?FFrame锛夛紝0 = 鐩磋皟 Func
+};
+typedef void (*PeFn)(UObject*, UFunction*, void*);
+static GtCallCtx g_gtc;
+// 鏈€杩戜竴娆?gtcall/gtcallpe 鐨勫弬鏁板揩鐓э紙gtparms 璇诲彇杩斿洖鍊硷級
+static uint8_t g_lastParms[512];
+static int g_lastParmsSize = 0;
+
+extern "C" void LoadTaskInvokeC() {
+    InterlockedExchange(&g_gtCapture, 1);
+    __try {
+        if (g_gtc.fn) {
+            int ex = 0;
+            if (g_gtc.usePE) {
+                void** vt = *(void***)g_gtc.ctx;
+                PeFn pe = vt ? (PeFn)vt[g_rt.processEventIndex] : nullptr;
+                if (!pe) { g_loadRec.result = -1; InterlockedExchange(&g_loadRec.state, 2); return; }
+                pe(g_gtc.ctx, g_gtc.fn, g_gtc.parms);
+                g_gtc.ex = 0;
+                g_loadRec.result = 0;
+                Log("[gtc-pe] %s ok", g_gtc.fnName);
+            } else {
+                ex = CallNativeFn(g_gtc.fn, g_gtc.ctx, g_gtc.parms, (uint16_t)g_gtc.psz,
+                                  g_gtc.retOff, g_gtc.retPtr);
+                g_gtc.ex = ex;
+                g_loadRec.result = ex;
+                Log("[gtc] call %s ex=%d ip=%llx mem=%llx", g_gtc.fnName, ex,
+                    (unsigned long long)g_gtIp, (unsigned long long)g_gtAddr);
+            }
+        } else {
+            LoadBpCtx* c = (LoadBpCtx*)g_loadRec.ctx;
+            int ex = -3;
+            if (c && c->f3 && c->lib && c->p3) {
+                char hexbuf[128] = {0};
+                for (int k = 0; k < 0x28; ++k) {
+                    char b[4];
+                    snprintf(b, sizeof(b), "%02x", c->p3[k]);
+                    if (k * 2 + 2 < (int)sizeof(hexbuf)) { hexbuf[k * 2] = b[0]; hexbuf[k * 2 + 1] = b[1]; }
+                }
+                Log("[gt] parms: %s", hexbuf);
+                ex = CallNativeFn(c->f3, c->lib, c->p3, 48, 0x28, c->p3 + 0x28);
+                c->e3 = ex;
+                if (ex != 0)
+                    Log("[gt] call raised 0x%x ip=%llx mem=%llx", ex,
+                        (unsigned long long)g_gtIp, (unsigned long long)g_gtAddr);
+                if (!ex && PtrReadable(c->p3 + 0x28, 8)) {
+                    c->got = *(uint64_t*)(c->p3 + 0x28);
+                    g_loadRec.classPtr = c->got;
+                }
+            }
+            g_loadRec.result = ex;
+            Log("[gt] load task ex=%d class=%llx", ex, (unsigned long long)g_loadRec.classPtr);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_loadRec.result = -1000 - (int)GetExceptionCode();
+        g_loadRec.classPtr = g_gtAddr;
+        Log("[gt] load task exception 0x%x ip=%llx mem=%llx", GetExceptionCode(),
+            (unsigned long long)g_gtIp, (unsigned long long)g_gtAddr);
+    }
+    InterlockedExchange(&g_gtCapture, 0);
+    InterlockedExchange(&g_loadRec.state, 2);
+}
+
+static std::string CmdLoadBp(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: loadbp <path>\"}";
+    UObject* lib = nullptr;
+    int n = NumObjects();
+    char nm[512], cls[256];
+    for (int i = 0; i < n && !lib; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+        if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, "KismetSystemLibrary") != 0) continue;
+        uint64_t cdo = 0;
+        if (PtrReadable((uint8_t*)o + 0x118, 8)) cdo = *(uint64_t*)((uint8_t*)o + 0x118);
+        if (cdo && PtrReadable((void*)cdo, 0x28)) lib = (UObject*)cdo;
+    }
+    if (!lib) return "{\"ok\":false,\"error\":\"CDO not found\"}";
+    UFunction* f1 = FindFunction("MakeSoftClassPath");
+    UFunction* f2 = FindFunction("Conv_SoftClassPathToSoftClassRef");
+    UFunction* f3 = FindFunction("LoadClassAsset_Blocking");
+    if (!f1 || !f2 || !f3) return "{\"ok\":false,\"error\":\"chain functions missing\"}";
+    uint8_t* p1 = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 128);
+    uint8_t* p2 = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 160);
+    uint8_t* p3 = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 128);
+    if (!p1 || !p2 || !p3) return "{\"ok\":false,\"error\":\"alloc\"}";
+    size_t len = a[1].size();
+    wchar_t* wb = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (len + 1) * 2);
+    for (size_t k = 0; k < len; ++k) wb[k] = (wchar_t)(unsigned char)a[1][k];
+    *(wchar_t**)p1 = wb; *(int32_t*)(p1 + 8) = (int32_t)(len + 1); *(int32_t*)(p1 + 12) = (int32_t)(len + 1);
+    (void)f2;
+    LoadBpCtx& c = g_lbCtx;
+    c.lib = lib; c.f1 = f1; c.f3 = f3; c.p1 = p1; c.p3 = p3;
+    c.registered = 0; c.e1 = -1; c.e3 = -1; c.got = 0;
+    bool ran = false;
+    if (g_useGameThreadHook) {
+        ran = SubmitGtTask(&c, LoadBpTaskFn, 3000);
+    } else {
+        LoadBpTaskFn(&c);
+        ran = (c.e1 == 0 && c.e3 == 0);
+    }
+    int e1 = c.e1, e3 = c.e3;
+    uint32_t registered = c.registered;
+    if (c.got) { /* class loaded */ }
+    uint64_t got = 0;
+    if (PtrReadable(p3 + 0x28, 8)) got = *(uint64_t*)(p3 + 0x28);
+    uint32_t fn1 = 0, fn2 = registered;
+    memcpy(&fn1, p1 + 0x10, 4);
+    HeapFree(GetProcessHeap(), 0, p1); HeapFree(GetProcessHeap(), 0, p2); HeapFree(GetProcessHeap(), 0, p3);
+    return std::string("{\"ok\":") + ((ran && e1==0 && e3==0) ? "true" : "false") +
+           ",\"e\":[\"" + std::to_string(e1) + "\",\"" + std::to_string(e3) + "\"]" +
+           ",\"softPathFName\":" + std::to_string(fn1) +
+           ",\"softRefFName\":" + std::to_string(fn2) +
+           ",\"classPtr\":\"" + std::to_string((unsigned long long)got) + "\"}";
+}
+
+static std::string CmdFindInst(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: findinst <ClassName> [max]\"}";
+    int mx = a.size() > 2 ? atoi(a[2].c_str()) : 40;
+    if (mx <= 0 || mx > 500) mx = 40;
+    int n = NumObjects();
+    char nm[512], cls[256];
+    std::string out = "{\"ok\":true,\"items\":[";
+    int found = 0;
+    for (int i = 0; i < n && found < mx; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (!TryClassName(o, cls, sizeof(cls)) || a[1] != cls) continue;
+        if (!TryObjectName(o, nm, sizeof(nm))) nm[0] = 0;
+        if (found) out += ",";
+        ++found;
+        out += "{\"i\":" + std::to_string(i) + ",\"addr\":\"" + std::to_string((unsigned long long)o) +
+               "\",\"name\":\"" + JsonEscape(nm) + "\"}";
+    }
+    out += "],\"count\":" + std::to_string(found) + "}";
+    return out;
+}
+
+static std::string CmdFindVt(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: findvt <ClassName> [from] [to]\"}";
+    int from = a.size() > 2 ? atoi(a[2].c_str()) : 60;
+    int to = a.size() > 3 ? atoi(a[3].c_str()) : 130;
+    if (from < 0 || to > 300 || to <= from) return "{\"ok\":false,\"error\":\"bad range\"}";
+    UObject* cdo = FindCdo(a[1].c_str());
+    if (!cdo) return "{\"ok\":false,\"error\":\"CDO not found\"}";
+    void** vt = *(void***)cdo;
+    std::string out = "{\"ok\":true,\"cdo\":\"" + std::to_string((unsigned long long)cdo) +
+                      "\",\"vt\":\"" + std::to_string((unsigned long long)vt) + "\",\"slots\":[";
+    for (int i = from; i < to; ++i) {
+        if (!PtrReadable(vt + i, 8)) break;
+        if (i > from) out += ",";
+        out += "{\"i\":" + std::to_string(i) + ",\"a\":\"" + std::to_string((unsigned long long)vt[i]) + "\"}";
+    }
+    out += "]}";
+    return out;
+}
+
+static std::string CmdTickProbe(const std::vector<std::string>& a) {
+    // tickprobe <slot> <patchSize> [ms] [class]
+    if (a.size() < 3) return "{\"ok\":false,\"error\":\"usage: tickprobe <slot> <patchSize> [ms] [class]\"}";
+    int slot = atoi(a[1].c_str());
+    int psz = atoi(a[2].c_str());
+    int ms = a.size() > 3 ? atoi(a[3].c_str()) : 2500;
+    const char* clsName = a.size() > 4 ? a[4].c_str() : "GameEngine";
+    uintptr_t target = GetVtSlot(clsName, slot);
+    if (!target) return "{\"ok\":false,\"error\":\"vtable slot unavailable\"}";
+    int idx = -1;
+    for (int i = 0; i < g_probeCount; ++i)
+        if (g_probeTargets[i] == target) idx = i;
+    if (idx < 0) {
+        if (g_probeCount >= 64) return "{\"ok\":false,\"error\":\"too many probe hooks\"}";
+        idx = g_probeCount++;
+        ProbeRec& rec = g_probeRecs[idx];
+        memset(&rec, 0, sizeof(rec));
+        uint8_t* stub = MakeStub((uintptr_t)&ProbeHookCore, &rec);
+        if (!stub) return "{\"ok\":false,\"error\":\"stub alloc failed\"}";
+        if (!InstallPatch(target, psz, (void*)stub, &rec.trampoline, nullptr))
+            return "{\"ok\":false,\"error\":\"patch failed\"}";
+        rec.stub = (uintptr_t)stub;
+        g_probeTargets[idx] = target;
+    }
+    ProbeRec& rec = g_probeRecs[idx];
+    memset((uint8_t*)&rec, 0, 0x78);   // 娓呴噰鏍峰瓧娈碉紝淇濈暀 trampoline/stub
+    InterlockedExchange(&rec.state, 1);
+    Sleep(ms);
+    InterlockedExchange(&rec.state, 0);
+    std::string out = "{\"ok\":true,\"slot\":" + std::to_string(slot) +
+                      ",\"target\":\"" + std::to_string((unsigned long long)target) +
+                      "\",\"count\":" + std::to_string(rec.count) +
+                      ",\"deltas\":[";
+    for (int i = 0; i < rec.nDelta && i < 8; ++i) {
+        if (i) out += ",";
+        char b[64];
+        snprintf(b, sizeof(b), "%.6f", (double)rec.deltas[i]);
+        out += b;
+    }
+    out += "],\"rdxs\":[";
+    for (int i = 0; i < rec.nRdx && i < 8; ++i) {
+        if (i) out += ",";
+        out += std::to_string(rec.rdxs[i]);
+    }
+    out += "],\"tids\":[";
+    for (int i = 0; i < rec.nTid && i < 4; ++i) {
+        if (i) out += ",";
+        out += std::to_string(rec.tids[i]);
+    }
+    out += "]}";
+    return out;
+}
+
+static std::string CmdGtLoad(const std::vector<std::string>& a) {
+    // gtload <pathOrId> [slot] [patchSize] [tid] [class] [mode] [fn]
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: gtload <pathOrId> [slot] [patchSize] [tid] [class] [mode] [fn]\"}";
+    int slot = a.size() > 2 ? atoi(a[2].c_str()) : 82;
+    int psz = a.size() > 3 ? atoi(a[3].c_str()) : 16;
+    DWORD tid = a.size() > 4 ? (DWORD)strtoul(a[4].c_str(), nullptr, 10) : 0;
+    const char* clsName = a.size() > 5 ? a[5].c_str() : "GameEngine";
+    int mode = a.size() > 6 ? atoi(a[6].c_str()) : 0;
+    const char* fnName = a.size() > 7 ? a[7].c_str() : "LoadClassAsset_Blocking";
+
+    uint32_t pathId = 0;
+    std::string wanted = a[1];
+    if (!wanted.empty() && isdigit((unsigned char)wanted[0])) {
+        pathId = (uint32_t)strtoul(wanted.c_str(), nullptr, 10);
+    } else {
+        auto hits = FindNames(wanted, 4000);
+        for (auto& h : hits) if (h.second == wanted) { pathId = h.first; break; }
+        if (!pathId && wanted.size() > 2 && wanted.compare(wanted.size() - 2, 2, "_C") == 0) {
+            std::string noC = wanted.substr(0, wanted.size() - 2);
+            auto h2 = FindNames(noC, 4000);
+            for (auto& h : h2) if (h.second == noC) { pathId = h.first; break; }
+        }
+        if (!pathId) {
+            size_t slash = wanted.find_last_of('/');
+            std::string base = slash == std::string::npos ? wanted : wanted.substr(slash + 1);
+            size_t dot = base.find('.');
+            if (dot != std::string::npos) base = base.substr(0, dot);
+            auto h3 = FindNames(base, 4000);
+            for (auto& h : h3) if (h.second == base) { pathId = h.first; break; }
+        }
+    }
+    if (!pathId && !isdigit((unsigned char)wanted[0])) return "{\"ok\":false,\"error\":\"asset path not in FName table\"}";
+
+    UFunction* f3 = FindFunction(fnName);
+    if (!f3) return "{\"ok\":false,\"error\":\"loader function not found\"}";
+    UObject* lib = FindCdo("KismetSystemLibrary");
+    if (!lib) return "{\"ok\":false,\"error\":\"KismetSystemLibrary CDO not found\"}";
+    uintptr_t target = GetVtSlot(clsName, slot);
+    if (!target) return "{\"ok\":false,\"error\":\"vtable slot unavailable\"}";
+    if (!g_loadRec.stub) {
+        uint8_t* stub = MakeStub((uintptr_t)&LoadHookCore, &g_loadRec);
+        if (!stub) return "{\"ok\":false,\"error\":\"stub alloc failed\"}";
+        if (!InstallPatch(target, psz, (void*)stub, &g_loadRec.trampoline, nullptr))
+            return "{\"ok\":false,\"error\":\"patch failed\"}";
+        g_loadRec.stub = (uintptr_t)stub;
+        g_loadTarget = target;
+    } else if (g_loadTarget != target) {
+        return "{\"ok\":false,\"error\":\"load hook already on another target\"}";
+    }
+    uint8_t* p3 = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 256);
+    if (!p3) return "{\"ok\":false,\"error\":\"alloc\"}";
+    wchar_t* subBuf = nullptr;
+    if (isdigit((unsigned char)wanted[0])) {
+        // 鏁板瓧 id锛氱洿鎺ュ～ FSoftObjectPath.AssetName
+        *(int32_t*)(p3 + 8) = (int32_t)pathId;
+    } else if (mode >= 4) {
+        // 閬楃暀椋庢牸锛欶Name = 瀹屾暣瀵硅薄璺緞 id锛堟棤 _C锛夛紝FString 绌?        int nameOff = (mode & 1) ? 0x10 : 0x08;
+        *(int32_t*)(p3 + nameOff) = (int32_t)pathId;
+        *(uint32_t*)(p3 + nameOff + 4) = 0;
+    } else if (mode == 6) {
+        // v3 甯冨眬锛欶Name(Package)@8 + FName(Object)@0x10 + FString@0x18
+        size_t dot = wanted.find_last_of('.');
+        std::string pkg = dot == std::string::npos ? wanted : wanted.substr(0, dot);
+        std::string obj = dot == std::string::npos ? std::string() : wanted.substr(dot + 1);
+        uint32_t pkgId = 0;
+        auto h4 = FindNames(pkg, 4000);
+        for (auto& h : h4) if (h.second == pkg) { pkgId = h.first; break; }
+        uint32_t objId = 0;
+        auto h5 = FindNames(obj, 4000);
+        for (auto& h : h5) if (h.second == obj) { objId = h.first; break; }
+        *(int32_t*)(p3 + 8) = (int32_t)pkgId;
+        *(int32_t*)(p3 + 0x10) = (int32_t)objId;
+        if (!obj.empty()) {
+            size_t n = obj.size();
+            subBuf = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (n + 1) * 2);
+            if (!subBuf) { HeapFree(GetProcessHeap(), 0, p3); return "{\"ok\":false,\"error\":\"alloc\"}"; }
+            for (size_t k = 0; k < n; ++k) subBuf[k] = (wchar_t)(unsigned char)obj[k];
+            subBuf[n] = 0;
+            *(wchar_t**)(p3 + 0x18) = subBuf;
+            *(int32_t*)(p3 + 0x20) = (int32_t)(n + 1);
+            *(int32_t*)(p3 + 0x24) = (int32_t)(n + 1);
+        }
+    } else {
+        // 瀛楃涓诧細鎸夋渶鍚庝竴涓?'.' 鎷嗗垎 鍖呰矾寰?/ 瀵硅薄鍚?        size_t dot = wanted.find_last_of('.');
+        std::string pkg = dot == std::string::npos ? wanted : wanted.substr(0, dot);
+        std::string obj = dot == std::string::npos ? std::string() : wanted.substr(dot + 1);
+        uint32_t pkgId = 0;
+        auto h4 = FindNames(pkg, 4000);
+        for (auto& h : h4) if (h.second == pkg) { pkgId = h.first; break; }
+        if (!pkgId) {
+            HeapFree(GetProcessHeap(), 0, p3);
+            return "{\"ok\":false,\"error\":\"package path not in FName table\"}";
+        }
+        int nameOff = (mode & 1) ? 0x10 : 0x08;    // 甯冨眬鐭╅樀锛欶Name 浣嶇疆
+        int strOff  = (mode & 1) ? 0x18 : 0x10;    // FString 浣嶇疆
+        std::string sub = (mode >= 2) ? wanted : obj;  // mode>=2: FString 鏀惧叏璺緞
+        *(int32_t*)(p3 + nameOff) = (int32_t)pkgId;
+        *(uint32_t*)(p3 + nameOff + 4) = 0;
+        if (!sub.empty()) {
+            size_t n = sub.size();
+            subBuf = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (n + 1) * 2);
+            if (!subBuf) { HeapFree(GetProcessHeap(), 0, p3); return "{\"ok\":false,\"error\":\"alloc\"}"; }
+            for (size_t k = 0; k < n; ++k) subBuf[k] = (wchar_t)(unsigned char)sub[k];
+            subBuf[n] = 0;
+            *(wchar_t**)(p3 + strOff) = subBuf;
+            *(int32_t*)(p3 + strOff + 8) = (int32_t)(n + 1);
+            *(int32_t*)(p3 + strOff + 12) = (int32_t)(n + 1);
+        }
+    }
+    LoadBpCtx& c = g_lbCtx;
+    c.lib = lib; c.f1 = nullptr; c.f3 = f3; c.p1 = nullptr; c.p3 = p3;
+    c.registered = pathId; c.e1 = 0; c.e3 = -1; c.got = 0;
+    g_loadRec.ctx = &c;
+    g_loadRec.expectedTid = tid;
+    g_loadRec.result = -1;
+    g_loadRec.classPtr = 0;
+    InterlockedExchange(&g_loadRec.state, 0);
+    bool fired = false;
+    for (int i = 0; i < 15000; ++i) {
+        if (InterlockedCompareExchange(&g_loadRec.state, 3, 3) == 2) { fired = true; break; }
+        Sleep(1);
+    }
+    if (!fired) InterlockedExchange(&g_loadRec.state, 2);   // disarm late fire
+    uint64_t got = g_loadRec.classPtr;
+    int ex = g_loadRec.result;
+    // 璇诲彇瀹為檯濉啓鐨?pkgId锛堝瓧绗︿覆妯″紡鎷嗗垎鍚庝笌鍏ュ弬 pathId 涓嶅悓锛?    uint32_t filledId = 0;
+    if (PtrReadable(p3 + 8, 4)) memcpy(&filledId, p3 + 8, 4);
+    // 鏁呮剰涓嶉噴鏀?p3/subBuf锛歡tinfo 妫€鏌ヨ繑鍥炲€煎唴瀛樺唴瀹?    return std::string("{\"ok\":") + (fired && ex == 0 ? "true" : "false") +
+           ",\"fired\":" + (fired ? "true" : "false") +
+           ",\"ex\":" + std::to_string(ex) +
+           ",\"classPtr\":\"" + std::to_string((unsigned long long)got) +
+           "\",\"slot\":" + std::to_string(slot) + ",\"pathId\":" + std::to_string(pathId) +
+           ",\"filledId\":" + std::to_string(filledId) + "}";
+}
+
+static std::string CmdGtInfo(const std::vector<std::string>& a) {
+    (void)a;
+    LoadBpCtx& c = g_lbCtx;
+    if (!c.p3) return "{\"ok\":false,\"error\":\"no gtload yet\"}";
+    std::string hex;
+    for (int k = 0; k < 0x30; ++k) {
+        char b[4];
+        snprintf(b, sizeof(b), "%02x", c.p3[k]);
+        hex += b;
+    }
+    uint64_t got = g_loadRec.classPtr;
+    char nm[512] = {0}, cls[256] = {0};
+    bool valid = got && PtrReadable((void*)got, 0x28);
+    if (valid) {
+        TryObjectName((UObject*)got, nm, sizeof(nm));
+        TryClassName((UObject*)got, cls, sizeof(cls));
+    }
+    std::string out = "{\"ok\":true,\"parms\":\"" + hex +
+                      "\",\"classPtr\":\"" + std::to_string((unsigned long long)got) +
+                      "\",\"ptrValid\":" + (valid ? "true" : "false") +
+                      ",\"ptrName\":\"" + JsonEscape(nm) + "\",\"ptrClass\":\"" + JsonEscape(cls) + "\"}";
+    return out;
+}
+
+// 瑙ｆ瀽瀵硅薄璇存槑绗︼細0xADDR / @ClassName / CDO:Class / 绮剧‘瀵硅薄鍚?static UObject* ResolveObjSpec(const std::string& s) {
+    if (s.empty()) return nullptr;
+    if (s.rfind("0x", 0) == 0 || isdigit((unsigned char)s[0])) {
+        uintptr_t v = (uintptr_t)strtoull(s.c_str(), nullptr, 0);
+        if (PtrReadable((void*)v, 0x28)) return (UObject*)v;
+        return nullptr;
+    }
+    if (s.rfind("@", 0) == 0) {
+        std::string cn = s.substr(1);
+        int n = NumObjects();
+        char cls[256];
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (TryClassName(o, cls, sizeof(cls)) && cls == cn) return o;
+        }
+        return nullptr;
+    }
+    if (s.rfind("CDO:", 0) == 0) return FindCdo(s.substr(4).c_str());
+    int n = NumObjects();
+    char nm[512];
+    for (int i = 0; i < n; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (TryObjectName(o, nm, sizeof(nm)) && s == nm) return o;
+    }
+    return nullptr;
+}
+
+static std::string CmdGtCallImpl(const std::vector<std::string>& a, bool usePE) {
+    // gtcall <fnNameOrAddr> [ctx] [args...]
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: gtcall <fnName|0xADDR> [ctx] [s:text] [i:n] [b:n] [o:spec]\"}";
+    RefreshRanges();
+    UFunction* fn = nullptr;
+    if (a[1].rfind("0x", 0) == 0 || isdigit((unsigned char)a[1][0])) {
+        uintptr_t fa = (uintptr_t)strtoull(a[1].c_str(), nullptr, 0);
+        fn = (UFunction*)fa;   // 澶栧眰 SafeHandle 淇濇姢
+    } else {
+        fn = FindFunction(a[1]);
+    }
+    if (!fn) return "{\"ok\":false,\"error\":\"function not found\"}";
+    FunctionInfo fi;
+    bool haveDesc = DescribeFunction(fn, fi);
+    // el8: 鐩存帴璇?parmsSize锛堜笉渚濊禆 desc锛涙柊鐗堝紩鎿庡睘鎬ц蛋鏌ュ彲鑳藉け璐ワ級
+    int psz = 512;
+    {
+        uint16_t ps2 = *(uint16_t*)((uint8_t*)fn + 0xB6);
+        if (ps2 > 0 && ps2 <= 4096) psz = ps2;
+        else if (haveDesc && fi.parmsSize > 0) psz = fi.parmsSize;
+    }
+    UObject* ctx = nullptr;
+    int ai = 2;
+    if (ai < (int)a.size()) {
+        const std::string& t = a[ai];
+        bool looksLikeArg = (t.rfind("s:", 0) == 0 || t.rfind("i:", 0) == 0 ||
+                             t.rfind("b:", 0) == 0 || t.rfind("o:", 0) == 0);
+        // 鏄惧紡鍋忕Щ鍙傛暟褰㈠ 8:s:...锛屼篃瑙嗕负鍙傛暟鑰岄潪 ctx
+        if (!looksLikeArg && t.find(':') != std::string::npos) {
+            size_t c = t.find(':');
+            bool digits = c > 0;
+            for (size_t k = 0; k < c && digits; ++k) if (!isdigit((unsigned char)t[k])) digits = false;
+            if (digits) looksLikeArg = true;
+        }
+        if (!looksLikeArg) {
+            ctx = ResolveObjSpec(t);
+            ++ai;
+        }
+    }
+    if (!ctx) ctx = FindCdo("KismetSystemLibrary");
+    if (!ctx) return "{\"ok\":false,\"error\":\"context object not found\"}";
+    uint8_t* parms = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, psz + 64);
+    if (!parms) return "{\"ok\":false,\"error\":\"alloc\"}";
+    std::vector<wchar_t*> bufs;
+    // 椤哄簭鍙傛暟鍋忕Щ琛紙desc 鍙敤鏃舵寜灞炴€ч摼椤哄簭锛涘惁鍒欏繀椤荤敤鏄惧紡鍋忕Щ锛?    std::vector<int> seqOffs;
+    for (auto& p : fi.params) seqOffs.push_back(p.offset);
+    size_t seq = 0;
+    for (; ai < (int)a.size(); ++ai) {
+        std::string arg = a[ai];
+        int off = -1;
+        size_t c = arg.find(':');
+        if (c != std::string::npos && c > 0) {
+            bool digits = true;
+            for (size_t k = 0; k < c && digits; ++k) if (!isdigit((unsigned char)arg[k])) digits = false;
+            if (digits) { off = atoi(arg.substr(0, c).c_str()); arg = arg.substr(c + 1); }
+        }
+        if (off < 0) {
+            if (seq < seqOffs.size()) { off = seqOffs[seq]; ++seq; }
+            else { HeapFree(GetProcessHeap(), 0, parms); return "{\"ok\":false,\"error\":\"too many args / need explicit <off>: prefix\"}"; }
+        }
+        if (off < 0 || off + 16 > psz + 64) { HeapFree(GetProcessHeap(), 0, parms); return "{\"ok\":false,\"error\":\"arg offset out of range\"}"; }
+        uint8_t* dst = parms + off;
+        if (arg.rfind("s:", 0) == 0) {
+            std::wstring w = Utf8ToWide(arg.substr(2));
+            size_t n = w.size();
+            wchar_t* b = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (n + 1) * 2);
+            if (!b) break;
+            memcpy(b, w.c_str(), n * 2);
+            b[n] = 0;
+            *(wchar_t**)(dst) = b;
+            *(int32_t*)(dst + 8) = (int32_t)(n + 1);
+            *(int32_t*)(dst + 12) = (int32_t)(n + 1);
+            bufs.push_back(b);
+        } else if (arg.rfind("o:", 0) == 0) {
+            UObject* o = ResolveObjSpec(arg.substr(2));
+            *(uint64_t*)dst = (uint64_t)o;
+        } else if (arg.rfind("b:", 0) == 0) {
+            *(uint8_t*)dst = (uint8_t)atoi(arg.c_str() + 2);
+        } else if (arg.rfind("i:", 0) == 0) {
+            *(int32_t*)dst = atoi(arg.c_str() + 2);
+        } else if (arg.rfind("f:", 0) == 0) {
+            *(float*)dst = (float)atof(arg.c_str() + 2);
+        } else if (arg.rfind("v:", 0) == 0 || arg.rfind("r:", 0) == 0) {
+            // v:x,y,z 鎴?r:p,y,r 鈫?3 涓?float32
+            float vals[3] = {0, 0, 0};
+            const char* p2 = arg.c_str() + 2;
+            for (int t = 0; t < 3 && *p2; ++t) {
+                vals[t] = (float)atof(p2);
+                const char* comma = strchr(p2, ',');
+                if (!comma) break;
+                p2 = comma + 1;
+            }
+            *(float*)(dst) = vals[0];
+            *(float*)(dst + 4) = vals[1];
+            *(float*)(dst + 8) = vals[2];
+        }
+    }
+    uint16_t retOff = *(uint16_t*)((uint8_t*)fn + 0xB8);
+    // 纭繚 hook 宸茶锛堜笌 gtload 鍏变韩 Tick 妲戒綅 86锛?    uintptr_t target = GetVtSlot("GameEngine", 86);
+    if (!target) { HeapFree(GetProcessHeap(), 0, parms); return "{\"ok\":false,\"error\":\"no tick slot\"}";
+    }
+    if (!g_loadRec.stub) {
+        uint8_t* stub = MakeStub((uintptr_t)&LoadHookCore, &g_loadRec);
+        if (!stub) return "{\"ok\":false,\"error\":\"stub alloc failed\"}";
+        if (!InstallPatch(target, 14, (void*)stub, &g_loadRec.trampoline, nullptr))
+            return "{\"ok\":false,\"error\":\"patch failed\"}";
+        g_loadRec.stub = (uintptr_t)stub;
+        g_loadTarget = target;
+    }
+    memset(&g_gtc, 0, sizeof(g_gtc));
+    g_gtc.fn = fn;
+    g_gtc.ctx = ctx;
+    g_gtc.parms = parms;
+    g_gtc.psz = psz;
+    g_gtc.retOff = retOff;
+    g_gtc.retPtr = (retOff != 0xffff && retOff < (uint16_t)psz) ? (void*)(parms + retOff) : (void*)parms;
+    g_gtc.usePE = usePE ? 1 : 0;
+    strncpy(g_gtc.fnName, a[1].c_str(), sizeof(g_gtc.fnName) - 1);
+    g_loadRec.ctx = nullptr;
+    g_loadRec.expectedTid = 0;
+    g_loadRec.result = -1;
+    InterlockedExchange(&g_loadRec.state, 0);
+    bool fired = false;
+    for (int i = 0; i < 10000; ++i) {
+        if (InterlockedCompareExchange(&g_loadRec.state, 3, 3) == 2) { fired = true; break; }
+        Sleep(1);
+    }
+    if (!fired) InterlockedExchange(&g_loadRec.state, 2);
+    int ex = g_gtc.ex;
+    // 淇濈暀鏈€鍚庝竴浠?parms 蹇収锛堢敤浜庤鍙栬繑鍥炲€硷級
+    {
+        size_t cp = (size_t)(psz > 0 ? psz : 0);
+        if (cp > sizeof(g_lastParms)) cp = sizeof(g_lastParms);
+        memcpy(g_lastParms, parms, cp);
+        g_lastParmsSize = (int)cp;
+    }
+    for (wchar_t* b : bufs) HeapFree(GetProcessHeap(), 0, b);
+    HeapFree(GetProcessHeap(), 0, parms);
+    return std::string("{\"ok\":") + (fired && ex == 0 ? "true" : "false") +
+           ",\"fired\":" + (fired ? "true" : "false") +
+           ",\"ex\":" + std::to_string(ex) +
+           ",\"fn\":\"" + JsonEscape(a[1]) + "\"}";
+}
+
+static std::string CmdGtCall(const std::vector<std::string>& a) { return CmdGtCallImpl(a, false); }
+static std::string CmdGtCallPe(const std::vector<std::string>& a) { return CmdGtCallImpl(a, true); }
+
+static std::string CmdGtParms(const std::vector<std::string>& a) {
+    (void)a;
+    std::string hex;
+    for (int k = 0; k < g_lastParmsSize; ++k) {
+        char b[4];
+        snprintf(b, sizeof(b), "%02x", g_lastParms[k]);
+        hex += b;
+    }
+    // 鍚屾椂鎸?float 瑙ｆ瀽锛堢敤浜庡潗鏍囪繑鍥炲€硷級
+    std::string floats;
+    for (int k = 0; k + 4 <= g_lastParmsSize && k < 96; k += 4) {
+        float f;
+        memcpy(&f, g_lastParms + k, 4);
+        if (floats.size()) floats += ",";
+        floats += std::to_string(f);
+    }
+    return "{\"ok\":true,\"size\":" + std::to_string(g_lastParmsSize) +
+           ",\"hex\":\"" + hex + "\",\"floats\":[" + floats + "]}";
+}
+
+// 鎸?OuterPrivate 鏌ユ壘鎵€鏈夊瓙瀵硅薄锛氳繑鍥?{i, addr, nameId, nameNum, classId}
+static std::string CmdFindClass(const std::vector<std::string>& a) {
+    // findclass <substr> [max] 鈥?绫诲悕鍖呭惈 substr 鐨勬墍鏈夊璞?    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: findclass <substr> [max]\"}";
+    int mx = a.size() > 2 ? atoi(a[2].c_str()) : 200;
+    if (mx <= 0 || mx > 5000) mx = 200;
+    int n = NumObjects();
+    char cls[256];
+    std::string out = "{\"ok\":true,\"items\":[";
+    int found = 0;
+    for (int i = 0; i < n && found < mx; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (!TryClassName(o, cls, sizeof(cls))) continue;
+        if (strstr(cls, a[1].c_str()) == nullptr) continue;
+        if (found) out += ",";
+        ++found;
+        out += "{\"i\":" + std::to_string(i) + ",\"addr\":\"" + std::to_string((unsigned long long)o) +
+               "\",\"nameId\":" + std::to_string((int32_t)o->NamePrivate.ComparisonIndex) +
+               ",\"nameNum\":" + std::to_string(o->NamePrivate.Number) +
+               ",\"class\":\"" + JsonEscape(cls) + "\"}";
+    }
+    out += "],\"count\":" + std::to_string(found) + "}";
+    return out;
+}
+
+// 鎸夌被瀵硅薄鎸囬拡鏌ユ壘瀹炰緥锛堜笉渚濊禆鍚嶅瓧瑙ｇ爜锛?static std::string CmdFindByClass(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: findbyclass <classAddrHex> [max]\"}";
+    uintptr_t cls = (uintptr_t)strtoull(a[1].c_str(), nullptr, 16);
+    int mx = a.size() > 2 ? atoi(a[2].c_str()) : 50;
+    if (mx <= 0 || mx > 2000) mx = 50;
+    int n = NumObjects();
+    std::string out = "{\"ok\":true,\"items\":[";
+    int found = 0;
+    for (int i = 0; i < n && found < mx; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o || o->ClassPrivate != (UObject*)cls) continue;
+        if (found) out += ",";
+        ++found;
+        out += "{\"i\":" + std::to_string(i) + ",\"addr\":\"" + std::to_string((unsigned long long)o) +
+               "\",\"nameId\":" + std::to_string((int32_t)o->NamePrivate.ComparisonIndex) + "}";
+    }
+    out += "],\"count\":" + std::to_string(found) + "}";
+    return out;
+}
+
+// 鎸夌被鍚?ID 鏌ユ壘瀹炰緥锛堟瘮瀵圭被鍚?NamePrivate 鐨?id锛屼笉渚濊禆瀛楃涓茶В鐮侊級
+static std::string CmdFindByClassNameId(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: findbyclassnameid <nameId> [max]\"}";
+    uint32_t cid = (uint32_t)strtoul(a[1].c_str(), nullptr, 0);
+    int mx = a.size() > 2 ? atoi(a[2].c_str()) : 50;
+    if (mx <= 0 || mx > 2000) mx = 50;
+    int n = NumObjects();
+    std::string out = "{\"ok\":true,\"items\":[";
+    int found = 0;
+    for (int i = 0; i < n && found < mx; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o || !o->ClassPrivate) continue;
+        if ((uint32_t)o->ClassPrivate->NamePrivate.ComparisonIndex != cid) continue;
+        if (found) out += ",";
+        ++found;
+        out += "{\"i\":" + std::to_string(i) + ",\"addr\":\"" + std::to_string((unsigned long long)o) +
+               "\",\"nameId\":" + std::to_string((int32_t)o->NamePrivate.ComparisonIndex) + "}";
+    }
+    out += "],\"count\":" + std::to_string(found) + "}";
+    return out;
+}
+
+// ---- 鍐呭瓨琛ヤ竵锛氳鍛戒护閫氳繃绠＄悊鍛樻鏌ワ紙涓嶄緷璧?AdminUsers.ini锛?----
+static bool WriteCode(uintptr_t addr, const void* data, size_t len) {
+    DWORD old = 0;
+    if (!VirtualProtect((void*)addr, len, PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy((void*)addr, data, len);
+    DWORD tmp = 0;
+    VirtualProtect((void*)addr, len, old, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), (void*)addr, len);
+    return true;
+}
+
+static std::string CmdPatchRet1(const std::vector<std::string>& a) {
+    // patchret1 <hexaddr> 鈥?鍐欏叆 mov al,1; ret
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: patchret1 <hexaddr>\"}";
+    uintptr_t addr = (uintptr_t)strtoull(a[1].c_str(), nullptr, 16);
+    const uint8_t stub[3] = { 0xB0, 0x01, 0xC3 };
+    if (!WriteCode(addr, stub, 3)) return "{\"ok\":false,\"error\":\"VirtualProtect failed\"}";
+    return "{\"ok\":true,\"addr\":\"" + a[1] + "\"}";
+}
+
+static std::string CmdWriteMem(const std::vector<std::string>& a) {
+    // writemem <hexaddr> <hexbytes>
+    if (a.size() < 3) return "{\"ok\":false,\"error\":\"usage: writemem <hexaddr> <hexbytes>\"}";
+    uintptr_t addr = (uintptr_t)strtoull(a[1].c_str(), nullptr, 16);
+    std::vector<uint8_t> bytes;
+    const std::string& hs = a[2];
+    for (size_t i = 0; i + 1 < hs.size(); i += 2) {
+        char b[3] = { hs[i], hs[i + 1], 0 };
+        bytes.push_back((uint8_t)strtoul(b, nullptr, 16));
+    }
+    if (bytes.empty()) return "{\"ok\":false,\"error\":\"no bytes\"}";
+    if (!WriteCode(addr, bytes.data(), bytes.size())) return "{\"ok\":false,\"error\":\"VirtualProtect failed\"}";
+    return "{\"ok\":true,\"addr\":\"" + a[1] + "\"}";
+}
+
+// 鏈瀯寤虹殑绠＄悊鍛樻鏌?RVA锛堝簭瑷€鏍￠獙鍚庢墦琛ヤ竵锛屾亽杩斿洖 true锛?static std::string CmdInitpAdmin(const std::vector<std::string>& a) {
+    (void)a;
+    uintptr_t addr = g_rt.moduleBase + 0x1F8D8C0;
+    static const uint8_t prologue[13] = { 0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x81,0xEC,0x10,0x01,0x00,0x00 };
+    if (!PtrReadable((void*)addr, 16)) return "{\"ok\":false,\"error\":\"unreadable\"}";
+    if (memcmp((void*)addr, prologue, sizeof(prologue)) != 0)
+        return "{\"ok\":false,\"error\":\"prologue mismatch (build changed) - re-derive RVA\"}";
+    const uint8_t stub[3] = { 0xB0, 0x01, 0xC3 };
+    if (!WriteCode(addr, stub, 3)) return "{\"ok\":false,\"error\":\"write failed\"}";
+    Log("[admin] patched admin check at %p -> always true", (void*)addr);
+    return "{\"ok\":true,\"addr\":\"" + std::to_string((unsigned long long)addr) + "\"}";
+}
+
+static std::string ModuleDir() {
+    char buf[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    std::string s(buf);
+    size_t p = s.find_last_of("\\/");
+    return (p == std::string::npos) ? s : s.substr(0, p);
+}
+
+// ==== 瀹氬悜绠＄悊鍛橀挬瀛愶細鍙斁琛屾寚瀹?SteamID锛屽叾浣欑帺瀹惰蛋鍘熼€昏緫 ====
+static std::wstring g_adminTarget;      // 鐩爣 SteamID锛堝瀛楃锛?static void*        g_adminStub = nullptr;   // 閽╁瓙妗?static void*        g_adminTramp = nullptr;  // 鍘熷鎸囦护璺虫澘
+static bool         g_adminHooked = false;
+
+// 琚挬浣忕殑妫€鏌ュ嚱鏁版嬁鍒扮殑鍙傛暟锛氬瀛楃涓诧紙FString/std::wstring 鐨勯潪 SSO 甯冨眬锛?0 鎸囬拡 +8 闀垮害锛?static int __cdecl AdminCheckFilter(void* pstr) {
+    if (!pstr || g_adminTarget.empty()) return 0;
+    const uint8_t* b = (const uint8_t*)pstr;
+    if (!PtrReadable((void*)b, 16)) return 0;
+    const wchar_t* s = *(const wchar_t**)b;
+    int32_t n = *(int32_t*)(b + 8);
+    if (n <= 0 || n > 64) return 0;
+    if ((size_t)n != g_adminTarget.size()) return 0;
+    if (!s || !PtrReadable((void*)s, (size_t)n * 2)) return 0;
+    return (wmemcmp(s, g_adminTarget.c_str(), (size_t)n) == 0) ? 1 : 0;
+}
+
+static void* AllocExec(size_t n) {
+    void* p = VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    return p;
+}
+
+// 鍦?moduleBase 闄勮繎锛埪?GB 鍐咃紝婊¤冻 E9 rel32 閲忕▼锛夊垎閰嶅彲鎵ц鍐呭瓨
+static void* AllocExecNear(size_t n, uintptr_t nearAddr, uintptr_t maxDist) {
+    static const uintptr_t offsets[] = {
+        0x08000000ULL, 0x10000000ULL, 0x18000000ULL, 0x20000000ULL,
+        0x28000000ULL, 0x30000000ULL, 0x40000000ULL, 0x50000000ULL,
+        0x60000000ULL, 0x70000000ULL
+    };
+    for (uintptr_t off : offsets) {
+        if (off >= maxDist) continue;
+        void* want = (void*)((nearAddr + off) & ~(uintptr_t)0xFFF);
+        void* p = VirtualAlloc(want, n, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (p) return p;
+    }
+    // 鍙嶅悜涔熻瘯涓€涓?    for (uintptr_t off : offsets) {
+        if (off >= maxDist) continue;
+        uintptr_t base = (nearAddr > off) ? (nearAddr - off) : 0;
+        if (!base) continue;
+        void* want = (void*)(base & ~(uintptr_t)0xFFF);
+        void* p = VirtualAlloc(want, n, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (p) return p;
+    }
+    return nullptr;
+}
+
+static void EmitBytes(uint8_t*& p, const void* src, size_t n) {
+    memcpy(p, src, n); p += n;
+}
+
+static bool InstallAdminHook() {
+    if (g_adminHooked) return true;
+    uintptr_t target = g_rt.moduleBase + 0x1F8D8C0;
+    static const uint8_t prologue[5] = { 0x48, 0x89, 0x5C, 0x24, 0x10 };  // mov [rsp+0x10], rbx
+    if (!PtrReadable((void*)target, 16)) return false;
+    if (memcmp((void*)target, prologue, 5) != 0) return false;
+
+    // 璺虫澘涓庢々閮藉繀椤昏惤鍦?target 卤2GB 鍐咃紙E9 rel32 閲忕▼锛夛紝鍚﹀垯浼氳烦椋?    const uintptr_t kMaxDist = 0x70000000ULL;
+    uint8_t* tramp = (uint8_t*)AllocExecNear(64, target, kMaxDist);
+    if (!tramp) return false;
+    uint8_t* t = tramp;
+    EmitBytes(t, prologue, 5);
+    uint8_t movRax[2] = { 0x48, 0xB8 };
+    EmitBytes(t, movRax, 2);
+    uint64_t cont = target + 5;
+    EmitBytes(t, &cont, 8);
+    uint8_t jmpRax[2] = { 0xFF, 0xE0 };
+    EmitBytes(t, jmpRax, 2);
+    g_adminTramp = tramp;
+
+    // 閽╁瓙妗╋細鍏堥棶杩囨护鍣紝鍛戒腑杩斿洖 1锛屽惁鍒欒蛋璺虫澘
+    uint8_t* stub = (uint8_t*)AllocExecNear(128, target, kMaxDist);
+    if (!stub) return false;
+    uint8_t* s = stub;
+    static const uint8_t sub_28[] = { 0x48, 0x83, 0xEC, 0x28 };          // sub rsp,0x28
+    static const uint8_t save_rcx[] = { 0x48, 0x89, 0x4C, 0x24, 0x20 };  // mov [rsp+0x20],rcx
+    EmitBytes(s, sub_28, sizeof(sub_28));
+    EmitBytes(s, save_rcx, sizeof(save_rcx));
+    EmitBytes(s, movRax, 2);
+    uint64_t filt = (uint64_t)(uintptr_t)&AdminCheckFilter;
+    EmitBytes(s, &filt, 8);
+    static const uint8_t call_rax[] = { 0xFF, 0xD0 };                    // call rax
+    EmitBytes(s, call_rax, sizeof(call_rax));
+    static const uint8_t restore[] = { 0x48, 0x8B, 0x4C, 0x24, 0x20, 0x48, 0x83, 0xC4, 0x28 }; // mov rcx,[rsp+0x20]; add rsp,0x28
+    EmitBytes(s, restore, sizeof(restore));
+    static const uint8_t test_je[] = { 0x85, 0xC0, 0x74, 0x06 };          // test eax,eax; je +6 (璺宠繃 mov eax,1;ret)
+    EmitBytes(s, test_je, sizeof(test_je));
+    static const uint8_t ret1[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 }; // mov eax,1; ret
+    EmitBytes(s, ret1, sizeof(ret1));
+    EmitBytes(s, movRax, 2);
+    uint64_t tr = (uint64_t)(uintptr_t)tramp;
+    EmitBytes(s, &tr, 8);
+    EmitBytes(s, jmpRax, 2);
+    g_adminStub = stub;
+
+    // 鎵撹ˉ涓侊細E9 rel32 -> stub锛堝厛纭鐩稿璺濈鍙敤 int32 琛ㄧず锛?    intptr_t dist = (intptr_t)stub - (intptr_t)(target + 5);
+    if (dist > 0x7FFFFFFFLL || dist < -0x7FFFFFFFLL) {
+        Log("[admhook] stub out of rel32 range: %p -> %p (dist=%lld)", (void*)target, stub, (long long)dist);
+        return false;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect((void*)target, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+    uint8_t patch[5];
+    patch[0] = 0xE9;
+    int32_t rel = (int32_t)((intptr_t)stub - ((intptr_t)target + 5));
+    memcpy(patch + 1, &rel, 4);
+    memcpy((void*)target, patch, 5);
+    DWORD tmp = 0;
+    VirtualProtect((void*)target, 5, old, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), (void*)target, 5);
+    g_adminHooked = true;
+    Log("[admhook] installed: target=%p stub=%p tramp=%p", (void*)target, stub, tramp);
+    return true;
+}
+
+static std::string CmdSetAdminTarget(const std::vector<std::string>& a) {
+    // setadmintarget <steamid>
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: setadmintarget <steamid>\"}";
+    std::wstring w = Utf8ToWide(a[1]);
+    g_adminTarget = w;
+    // 鎸佷箙鍖栵紝閲嶅惎鍚庤嚜鍔ㄥ姞杞?    std::string path = ModuleDir() + "\\scum_harness_admin.txt";
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wr = 0;
+        WriteFile(h, a[1].c_str(), (DWORD)a[1].size(), &wr, nullptr);
+        CloseHandle(h);
+    }
+    return "{\"ok\":true,\"target\":\"" + JsonEscape(a[1]) + "\",\"len\":" + std::to_string(w.size()) + "}";
+}
+
+static std::string CmdInstallAdm(const std::vector<std::string>& a) {
+    (void)a;
+    if (g_adminTarget.empty()) return "{\"ok\":false,\"error\":\"setadmintarget first\"}";
+    if (!InstallAdminHook()) return "{\"ok\":false,\"error\":\"hook failed (prologue/already patched)\"}";
+    return "{\"ok\":true,\"hooked\":true}";
+}
+
+static std::string CmdAdmState(const std::vector<std::string>& a) {
+    (void)a;
+    std::string t;
+    for (wchar_t c : g_adminTarget) t += (c < 128 ? (char)c : '?');
+    return "{\"ok\":true,\"hooked\":" + std::string(g_adminHooked ? "true" : "false") +
+           ",\"target\":\"" + t + "\",\"stub\":\"" +
+           std::to_string((unsigned long long)g_adminStub) + "\"}";
+}
+
+// 鎸?OuterPrivate 鏌ユ壘鎵€鏈夊瓙瀵硅薄锛氳繑鍥?{i, addr, nameId, nameNum, classId}
+static std::string CmdFindByOuter(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: findbyouter <addr> [max]\"}";
+    uintptr_t outer = (uintptr_t)strtoull(a[1].c_str(), nullptr, 16);
+    int mx = a.size() > 2 ? atoi(a[2].c_str()) : 500;
+    if (mx <= 0 || mx > 5000) mx = 500;
+    int n = NumObjects();
+    char cls[256];
+    std::string out = "{\"ok\":true,\"outer\":\"" + std::to_string((unsigned long long)outer) +
+                      "\",\"items\":[";
+    int found = 0;
+    for (int i = 0; i < n && found < mx; ++i) {
+        UObject* o = GetObjectByIndex(i);
+        if (!o) continue;
+        if (o->OuterPrivate != (UObject*)outer) continue;
+        if (!TryClassName(o, cls, sizeof(cls))) cls[0] = 0;
+        if (found) out += ",";
+        ++found;
+        out += "{\"i\":" + std::to_string(i) + ",\"addr\":\"" + std::to_string((unsigned long long)o) +
+               "\",\"nameId\":" + std::to_string((int32_t)o->NamePrivate.ComparisonIndex) +
+               ",\"nameNum\":" + std::to_string(o->NamePrivate.Number) +
+               ",\"class\":\"" + JsonEscape(cls) + "\"}";
+    }
+    out += "],\"count\":" + std::to_string(found) + "}";
+    return out;
+}
+
+// 鎸夊璞＄储寮?dump UObject 澶?+ 鍘熷鍚嶅瓧 id
+static std::string CmdDumpIdx(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: dumpidx <index>\"}";
+    int idx = atoi(a[1].c_str());
+    UObject* o = GetObjectByIndex(idx);
+    if (!o) return "{\"ok\":false,\"error\":\"object not found\"}";
+    char cls[256] = {0};
+    TryClassName(o, cls, sizeof(cls));
+    std::string out = "{\"ok\":true,\"i\":" + std::to_string(idx) +
+                      ",\"addr\":\"" + std::to_string((unsigned long long)o) +
+                      "\",\"nameId\":" + std::to_string((int32_t)o->NamePrivate.ComparisonIndex) +
+                      ",\"nameNum\":" + std::to_string(o->NamePrivate.Number) +
+                      ",\"outer\":\"" + std::to_string((unsigned long long)o->OuterPrivate) +
+                      "\",\"class\":\"" + JsonEscape(cls) + "\"}";
+    return out;
+}
+
+static std::string CmdRaw(const std::vector<std::string>& a) {
+    if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: raw <hexaddr> [len]\"}";
+    uintptr_t addr = (uintptr_t)strtoull(a[1].c_str(), nullptr, 16);
+    int len = a.size() > 2 ? atoi(a[2].c_str()) : 64;
+    if (len <= 0 || len > 4096) len = 64;
+    std::string out = "{\"ok\":true,\"addr\":\"" + a[1] + "\",\"hex\":\"";
+    const unsigned char* p = (const unsigned char*)addr;
+    for (int i = 0; i < len; ++i) {
+        char b[4];
+        snprintf(b, sizeof(b), "%02x", p[i]);
+        out += b;
+    }
+    out += "\"}";
+    return out;
+}
+
+static std::string HandleLine(const std::string& line) {
+    std::vector<std::string> a = SplitArgs(line);
+    if (a.empty()) return "{\"ok\":false,\"error\":\"empty\"}";
+    std::string cmd = Lower(a[0]);
+
+    if (cmd == "ping")     return "{\"ok\":true,\"pong\":true}";
+    if (cmd == "stat")     return CmdStat();
+    if (cmd == "probe")    return CmdProbe(a);
+    if (cmd == "raw")      return CmdRaw(a);
+    if (cmd == "fname") {
+        if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: fname <id>\"}";
+        uint32_t id = (uint32_t)strtoul(a[1].c_str(), nullptr, 10);
+        char buf[512];
+        buf[0] = 0;
+        bool ok = DecodeNameById(id, buf, sizeof(buf));
+        return std::string("{\"ok\":") + (ok ? "true" : "false") + ",\"name\":\"" + JsonEscape(buf) + "\"}";
+    }
+    if (cmd == "cstest") {
+        if (a.size() < 1) return "{}";
+        const char* ctxClass = a.size() > 1 ? a[1].c_str() : "KismetStringLibrary";
+        const char* fnName = a.size() > 2 ? a[2].c_str() : "ToUpper";
+        UObject* obj = nullptr;
+        int n = NumObjects();
+        char nm[512], cls[256];
+        for (int i = 0; i < n && !obj; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, ctxClass) != 0) continue;
+            if (!TryObjectName(o, nm, sizeof(nm))) continue;
+            if (strncmp(nm, "Default__", 9) == 0) continue;
+            obj = o;
+        }
+        if (!obj) {
+            for (int i = 0; i < n && !obj; ++i) {
+                UObject* o = GetObjectByIndex(i);
+                if (!o) continue;
+                if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+                if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, ctxClass) != 0) continue;
+                uint64_t cdoPtr = 0;
+                if (PtrReadable((uint8_t*)o + 0x118, 8)) cdoPtr = *(uint64_t*)((uint8_t*)o + 0x118);
+                if (cdoPtr && PtrReadable((void*)cdoPtr, 0x28)) obj = (UObject*)cdoPtr;
+                else obj = o;
+            }
+        }
+        if (!obj) return "{\"ok\":false,\"error\":\"obj not found\"}";
+        UFunction* fn = FindFunction(fnName);
+        if (!fn) return "{\"ok\":false,\"error\":\"function not found\"}";
+        void** vt = *(void***)obj;
+        uintptr_t csAddr = 0, crAddr = 0;
+        if (PtrReadable(vt, 78 * 8)) { csAddr = (uintptr_t)vt[69]; crAddr = (uintptr_t)vt[70]; }
+        int callspace = -999;
+        int exCode = PeInvokeCallspace(csAddr, obj, fn, &callspace);
+        char objName[512] = {0}, objClass[256] = {0};
+        TryObjectName(obj, objName, sizeof(objName));
+        TryClassName(obj, objClass, sizeof(objClass));
+        return std::string("{\"ok\":true,\"obj\":\"") + JsonEscape(objName) +
+               "\",\"objClass\":\"" + JsonEscape(objClass) +
+               "\",\"callspace\":" + std::to_string(callspace) +
+               ",\"csAddr\":\"" + std::to_string((unsigned long long)csAddr) +
+               "\",\"crAddr\":\"" + std::to_string((unsigned long long)crAddr) +
+               "\",\"ex\":" + std::to_string(exCode) + "}";
+    }
+    if (cmd == "callfunc") {
+        if (a.size() < 3) return "{\"ok\":false,\"error\":\"usage: callfunc <ClassName> <FuncName> [str]\"}";
+        const char* wantClass = a[1].c_str();
+        const char* wantFunc = a[2].c_str();
+        UObject* obj = nullptr;
+        int n = NumObjects();
+        char nm[512], cls[256];
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+            if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, wantClass) != 0) continue;
+            uint64_t cdoPtr = 0;
+            if (PtrReadable((uint8_t*)o + 0x118, 8)) cdoPtr = *(uint64_t*)((uint8_t*)o + 0x118);
+            if (cdoPtr && PtrReadable((void*)cdoPtr, 0x28)) obj = (UObject*)cdoPtr;
+            break;
+        }
+        if (!obj) return "{\"ok\":false,\"error\":\"class CDO not found\"}";
+        UFunction* fn = FindFunction(wantFunc);
+        if (!fn) return "{\"ok\":false,\"error\":\"function not found\"}";
+        if (!PtrReadable(fn, 0xE0)) return "{\"ok\":false,\"error\":\"function memory unreadable\"}";
+        uint64_t funcAddr = *(uint64_t*)((uint8_t*)fn + 0xD8);
+        uint16_t parmsSize = *(uint16_t*)((uint8_t*)fn + 0xB6);
+        if (!funcAddr) return "{\"ok\":false,\"error\":\"native func pointer is null\"}";
+        // UFunction::Invoke(UObject* Obj, FFrame& Stack, void* RetVal) with this=UFunction
+        uintptr_t invokeAddr = g_rt.moduleBase + 0x2CB0890;
+        if (parmsSize == 0 || parmsSize > 1024) parmsSize = 64;
+        uint8_t* parms = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, parmsSize + 256);
+        uint8_t* frame = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 512);
+        if (!parms || !frame) return "{\"ok\":false,\"error\":\"alloc\"}";
+        if (a.size() > 3) {
+            // first parameter as FString
+            size_t len = a[3].size();
+            wchar_t* wbuf = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (len + 1) * 2);
+            if (wbuf) {
+                for (size_t k = 0; k < len; ++k) wbuf[k] = (wchar_t)(unsigned char)a[3][k];
+                *(wchar_t**)parms = wbuf;
+                *(int32_t*)(parms + 8) = (int32_t)(len + 1);
+                *(int32_t*)(parms + 12) = (int32_t)(len + 1);
+            }
+        }
+        // FFrame layout taken from ProcessEvent's own construction:
+        //   +0x00 vtable(FOutputDevice)  +0x08 flags(word 0x100)
+        //   +0x10 Node                   +0x18 Object
+        //   +0x20 Code                   +0x28 Locals
+        uint16_t retOff = *(uint16_t*)((uint8_t*)fn + 0xB8);
+        uint64_t* retVal = (uint64_t*)parms;
+        if (retOff != 0xFFFF && retOff + 8 <= parmsSize) retVal = (uint64_t*)(parms + retOff);
+        *(uint64_t*)(frame + 0x00) = (uint64_t)(g_rt.moduleBase + 0x6345A58);  // FOutputDevice vtable
+        *(uint16_t*)(frame + 0x08) = 0x100;
+        *(uint64_t*)(frame + 0x10) = (uint64_t)fn;      // Node
+        *(uint64_t*)(frame + 0x18) = (uint64_t)obj;     // Object
+        *(uint64_t*)(frame + 0x20) = 0;                 // Code
+        *(uint64_t*)(frame + 0x28) = (uint64_t)parms;   // Locals
+        // ProcessEvent sets Stack+0x80 from [UFunction+0x50]; native exec dereferences it.
+        uint64_t fn50 = 0;
+        if (PtrReadable((uint8_t*)fn + 0x50, 8)) fn50 = *(uint64_t*)((uint8_t*)fn + 0x50);
+        *(uint64_t*)(frame + 0x80) = fn50;
+        *(uint64_t*)(frame + 0x88) = (uint64_t)fn;      // CurrentNativeFunction
+        int exCode = PeInvokeInvokeNative(funcAddr, obj, frame, retVal);
+        std::string hex;
+        if (exCode == 0) {
+            for (int k = 0; k < parmsSize && k < 96; ++k) {
+                char hb[4];
+                snprintf(hb, sizeof(hb), "%02x", parms[k]);
+                hex += hb;
+            }
+        }
+        std::string str;
+        struct FS { wchar_t* Data; int32_t Num; int32_t Max; };
+        for (int cand = 0; cand + 16 <= parmsSize; cand += 8) {
+            FS* f = (FS*)(parms + cand);
+            if (f->Data && f->Num > 0 && f->Num < 256 && PtrReadable(f->Data, f->Num * 2)) {
+                std::string s;
+                for (int k = 0; k < f->Num - 1; ++k) s += (char)(f->Data[k] & 0x7F);
+                if (!s.empty() && str.size() < s.size()) str = s;
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, parms);
+        HeapFree(GetProcessHeap(), 0, frame);
+        return std::string("{\"ok\":") + (exCode == 0 ? "true" : "false") +
+               ",\"func\":\"" + std::to_string((unsigned long long)funcAddr) +
+               "\",\"parmsSize\":" + std::to_string(parmsSize) +
+               ",\"str\":\"" + JsonEscape(str) +
+               "\",\"ex\":" + std::to_string(exCode) + ",\"hex\":\"" + hex + "\"}";
+    }
+    if (cmd == "timetest") {
+        int idx = a.size() > 1 ? atoi(a[1].c_str()) : 65;
+        UObject* lib = nullptr;
+        int n = NumObjects();
+        char nm[512], cls[256];
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+            if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, "KismetSystemLibrary") != 0) continue;
+            uint64_t cdoPtr = 0;
+            if (PtrReadable((uint8_t*)o + 0x118, 8)) cdoPtr = *(uint64_t*)((uint8_t*)o + 0x118);
+            if (cdoPtr && PtrReadable((void*)cdoPtr, 0x28)) lib = (UObject*)cdoPtr;
+            break;
+        }
+        if (!lib) return "{\"ok\":false,\"error\":\"cdo not found\"}";
+        UFunction* fn = FindFunction("GetGameTimeInSeconds");
+        if (!fn) return "{\"ok\":false,\"error\":\"function not found\"}";
+        uint8_t* parms = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 128);
+        if (!parms) return "{\"ok\":false,\"error\":\"alloc\"}";
+        void** vt = *(void***)lib;
+        uintptr_t fnAddr = 0;
+        if (PtrReadable(vt, (idx + 1) * 8)) fnAddr = (uintptr_t)vt[idx];
+        int exCode = PeInvokeRaw(fnAddr, lib, fn, parms);
+        double d = 0; float fl = 0;
+        if (exCode == 0 && PtrReadable(parms, 8)) {
+            memcpy(&d, parms, 8);
+            memcpy(&fl, parms, 4);
+        }
+        int64_t asInt = 0;
+        if (exCode == 0) memcpy(&asInt, parms, 8);
+        HeapFree(GetProcessHeap(), 0, parms);
+        char dbuf[64];
+        snprintf(dbuf, sizeof(dbuf), "%.4f", d);
+        return std::string("{\"ok\":") + (exCode == 0 ? "true" : "false") +
+               ",\"idx\":" + std::to_string(idx) + ",\"d\":" + dbuf +
+               ",\"f\":" + std::to_string((double)fl) +
+               ",\"i\":" + std::to_string((long long)asInt) +
+               ",\"ex\":" + std::to_string(exCode) + "}";
+    }
+    if (cmd == "vtdump") {
+        UObject* lib = nullptr;
+        int n = NumObjects();
+        char nm[512], cls[256];
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+            if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, "KismetSystemLibrary") != 0) continue;
+            uint64_t cdoPtr = 0;
+            if (PtrReadable((uint8_t*)o + 0x118, 8)) cdoPtr = *(uint64_t*)((uint8_t*)o + 0x118);
+            if (cdoPtr && PtrReadable((void*)cdoPtr, 0x28)) lib = (UObject*)cdoPtr;
+            break;
+        }
+        if (!lib) return "{\"ok\":false,\"error\":\"cdo not found\"}";
+        void** vt = *(void***)lib;
+        std::string out = "{\"ok\":true,\"base\":\"" + std::to_string((unsigned long long)g_rt.moduleBase) +
+                          "\",\"vt\":\"" + std::to_string((unsigned long long)vt) + "\",\"slots\":[";
+        for (int i = 0; i < 96; ++i) {
+            if (!PtrReadable(vt + i, 8)) break;
+            if (i) out += ",";
+            out += std::to_string((unsigned long long)vt[i]);
+        }
+        out += "]}";
+        return out;
+    }
+    if (cmd == "hookpe") {
+        g_useGameThreadHook = (a.size() > 1 && a[1] == "on");
+        return std::string("{\"ok\":true,\"hookpe\":") + (g_useGameThreadHook ? "true" : "false") + "}";
+    }
+    if (cmd == "loadbp") return CmdLoadBp(a);
+    if (cmd == "findinst") return CmdFindInst(a);
+    if (cmd == "findvt")   return CmdFindVt(a);
+    if (cmd == "tickprobe") return CmdTickProbe(a);
+    if (cmd == "gtload")   return CmdGtLoad(a);
+    if (cmd == "gtinfo")   return CmdGtInfo(a);
+    if (cmd == "findbyouter") return CmdFindByOuter(a);
+    if (cmd == "findclass") return CmdFindClass(a);
+    if (cmd == "findbyclass") return CmdFindByClass(a);
+    if (cmd == "findbyclassnameid") return CmdFindByClassNameId(a);
+    if (cmd == "gtparms") return CmdGtParms(a);
+    if (cmd == "patchret1") return CmdPatchRet1(a);
+    if (cmd == "writemem") return CmdWriteMem(a);
+    if (cmd == "initpadm") return CmdInitpAdmin(a);
+    if (cmd == "setadmintarget") return CmdSetAdminTarget(a);
+    if (cmd == "installadm") return CmdInstallAdm(a);
+    if (cmd == "admstate") return CmdAdmState(a);
+    if (cmd == "dumpidx") return CmdDumpIdx(a);
+    if (cmd == "gtcall") return CmdGtCall(a);
+    if (cmd == "gtcallpe") return CmdGtCallPe(a);
+    if (cmd == "descaddr") {
+        if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: descaddr <hexaddr>\"}";
+        RefreshRanges();
+        uintptr_t fa = (uintptr_t)strtoull(a[1].c_str(), nullptr, 0);
+        FunctionInfo fi;
+        if (!DescribeFunction((UFunction*)fa, fi))
+            return "{\"ok\":false,\"error\":\"desc failed\"}";
+        std::string out = "{\"ok\":true,\"fn\":\"" + a[1] +
+                          "\",\"parmsSize\":" + std::to_string(fi.parmsSize) +
+                          ",\"params\":[";
+        for (size_t k = 0; k < fi.params.size(); ++k) {
+            if (k) out += ",";
+            out += "{\"name\":\"" + JsonEscape(fi.params[k].name) +
+                   "\",\"offset\":" + std::to_string(fi.params[k].offset) +
+                   ",\"size\":" + std::to_string(fi.params[k].size) + "}";
+        }
+        out += "]}";
+        return out;
+    }
+    if (cmd == "loadclass") {
+        if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: loadclass <AssetPathName> [func] [contextClass]\"}";
+        const char* fnName = a.size() > 2 ? a[2].c_str() : "LoadClassAsset_Blocking";
+        const char* ctxClass = a.size() > 3 ? a[3].c_str() : "KismetSystemLibrary";
+        // resolve CDO of KismetSystemLibrary (UClass+0x118)
+        UObject* lib = nullptr;
+        int n = NumObjects();
+        char nm[512], cls[256];
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+            if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, ctxClass) != 0) continue;
+            uint64_t cdoPtr = 0;
+            if (PtrReadable((uint8_t*)o + 0x118, 8)) cdoPtr = *(uint64_t*)((uint8_t*)o + 0x118);
+            if (cdoPtr && PtrReadable((void*)cdoPtr, 0x28)) lib = (UObject*)cdoPtr;
+            break;
+        }
+        // Prefer a real (non-CDO) instance: CDOs carry archetype flags that make
+        // ProcessEvent bail out before invoking the function.
+        {
+            UObject* inst = nullptr;
+            for (int i = 0; i < n && !inst; ++i) {
+                UObject* o = GetObjectByIndex(i);
+                if (!o) continue;
+                if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, ctxClass) != 0) continue;
+                if (!TryObjectName(o, nm, sizeof(nm))) continue;
+                if (strncmp(nm, "Default__", 9) == 0) continue;
+                inst = o;
+            }
+            if (inst) lib = inst;
+        }
+        if (!lib) return "{\"ok\":false,\"error\":\"context object not found\"}";
+        char libName[512] = {0}, libClass[256] = {0};
+        TryObjectName(lib, libName, sizeof(libName));
+        TryClassName(lib, libClass, sizeof(libClass));
+        // find the FName id for the asset path
+        uint32_t pathId = 0;
+        std::string wanted = a[1];
+        {
+            auto hits = FindNames(wanted, 4000);
+            for (auto& h : hits) if (h.second == wanted) { pathId = h.first; break; }
+            if (!pathId && wanted.size() > 2 && wanted.compare(wanted.size() - 2, 2, "_C") == 0) {
+                std::string noC = wanted.substr(0, wanted.size() - 2);
+                auto h2 = FindNames(noC, 4000);
+                for (auto& h : h2) if (h.second == noC) { pathId = h.first; break; }
+            }
+            if (!pathId) {
+                size_t slash = wanted.find_last_of('/');
+                std::string base = slash == std::string::npos ? wanted : wanted.substr(slash + 1);
+                size_t dot = base.find('.');
+                if (dot != std::string::npos) base = base.substr(0, dot);
+                auto h3 = FindNames(base, 4000);
+                for (auto& h : h3) if (h.second == base) { pathId = h.first; break; }
+            }
+        }
+        if (!pathId) return "{\"ok\":false,\"error\":\"asset path not in FName table\"}";
+        UFunction* fn = FindFunction(fnName);
+        if (!fn) return "{\"ok\":false,\"error\":\"loader function not found\"}";
+        uint8_t* parms = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 256);
+        uint8_t* frame = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 512);
+        if (!parms || !frame) return "{\"ok\":false,\"error\":\"alloc\"}";
+        // TSoftClassPtr: +0 FWeakObjectPtr(0), +8 FSoftObjectPath{FName AssetPathName, FString SubPathString}
+        *(int32_t*)(parms + 8) = (int32_t)pathId;
+        *(uint32_t*)(parms + 12) = 0;
+        uint64_t nativeFunc = 0;
+        if (PtrReadable((uint8_t*)fn + 0xD8, 8)) nativeFunc = *(uint64_t*)((uint8_t*)fn + 0xD8);
+        if (!nativeFunc) return "{\"ok\":false,\"error\":\"func pointer null\"}";
+        uint16_t psz = *(uint16_t*)((uint8_t*)fn + 0xB6);
+        uint16_t roff = *(uint16_t*)((uint8_t*)fn + 0xB8);
+        if (psz == 0 || psz > 1024) psz = 64;
+        uint64_t fn50 = 0;
+        if (PtrReadable((uint8_t*)fn + 0x50, 8)) fn50 = *(uint64_t*)((uint8_t*)fn + 0x50);
+        *(uint64_t*)(frame + 0x00) = (uint64_t)(g_rt.moduleBase + 0x6345A58);
+        *(uint16_t*)(frame + 0x08) = 0x100;
+        *(uint64_t*)(frame + 0x10) = (uint64_t)fn;
+        *(uint64_t*)(frame + 0x18) = (uint64_t)lib;
+        *(uint64_t*)(frame + 0x28) = (uint64_t)parms;
+        *(uint64_t*)(frame + 0x80) = fn50;
+        *(uint64_t*)(frame + 0x88) = (uint64_t)fn;
+        uint64_t* retPtr = (uint64_t*)parms;
+        if (roff != 0xFFFF && roff + 8 <= psz) retPtr = (uint64_t*)(parms + roff);
+        int exCode = PeInvokeInvokeNative(nativeFunc, lib, frame, retPtr);
+        std::string hex;
+        if (exCode == 0) {
+            for (int k = 0; k < 64; ++k) {
+                char hb[4];
+                snprintf(hb, sizeof(hb), "%02x", parms[k]);
+                hex += hb;
+            }
+        }
+        uint64_t ret0 = *(uint64_t*)parms;
+        uint64_t ret40 = 0;
+        if (PtrReadable(parms + 0x28, 8)) ret40 = *(uint64_t*)(parms + 0x28);
+        HeapFree(GetProcessHeap(), 0, parms);
+        return std::string("{\"ok\":") + (exCode == 0 ? "true" : "false") +
+               ",\"lib\":\"" + JsonEscape(libName) + "\",\"libClass\":\"" + JsonEscape(libClass) +
+               "\",\"pathId\":" + std::to_string(pathId) +
+               ",\"ret0\":\"" + std::to_string((unsigned long long)ret0) +
+               "\",\"ret40\":\"" + std::to_string((unsigned long long)ret40) +
+               "\",\"ex\":" + std::to_string(exCode) + ",\"hex\":\"" + hex + "\"}";
+    }
+    if (cmd == "strtest") {
+        int idx = a.size() > 1 ? atoi(a[1].c_str()) : 65;
+        const char* wantLib = a.size() > 2 ? a[2].c_str() : "KismetStringLibrary";
+        UObject* lib = nullptr;
+        int n = NumObjects();
+        char nm[512], cls[256];
+        char cdoName[512];
+        snprintf(cdoName, sizeof(cdoName), "Default__%s", wantLib);
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryObjectName(o, nm, sizeof(nm))) continue;
+            if (strcmp(nm, cdoName) != 0) continue;
+            lib = o; break;
+        }
+        if (!lib) {
+            UObject* uclass = nullptr;
+            for (int i = 0; i < n; ++i) {
+                UObject* o = GetObjectByIndex(i);
+                if (!o) continue;
+                if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+                if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, wantLib) != 0) continue;
+                uclass = o; break;
+            }
+            if (uclass) {
+                uint64_t cdoPtr = 0;
+                if (PtrReadable((uint8_t*)uclass + 0x118, 8)) cdoPtr = *(uint64_t*)((uint8_t*)uclass + 0x118);
+                if (cdoPtr && PtrReadable((void*)cdoPtr, 0x28)) lib = (UObject*)cdoPtr;
+                else lib = uclass;
+            }
+        }
+        {
+            UObject* inst = nullptr;
+            for (int i = 0; i < n && !inst; ++i) {
+                UObject* o = GetObjectByIndex(i);
+                if (!o) continue;
+                if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, wantLib) != 0) continue;
+                if (!TryObjectName(o, nm, sizeof(nm))) continue;
+                if (strncmp(nm, "Default__", 9) == 0) continue;
+                inst = o;
+            }
+            if (inst) lib = inst;
+        }
+        if (!lib) return "{\"ok\":false,\"error\":\"library class not found\"}";
+        UFunction* fn = FindFunction("ToUpper");
+        if (!fn) return "{\"ok\":false,\"error\":\"ToUpper not found\"}";
+        uint8_t* parms = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 128);
+        if (!parms) return "{\"ok\":false,\"error\":\"alloc\"}";
+        wchar_t* src = L"abc";
+        struct FS { wchar_t* Data; int32_t Num; int32_t Max; };
+        ((FS*)parms)->Data = src; ((FS*)parms)->Num = 4; ((FS*)parms)->Max = 4;
+        void** vt = *(void***)lib;
+        uintptr_t fnAddr = 0;
+        if (PtrReadable(vt, (idx + 1) * 8)) fnAddr = (uintptr_t)vt[idx];
+        int exCode = PeInvokeRaw(fnAddr, lib, fn, parms);
+        char libN[512] = {0}, libC[256] = {0};
+        TryObjectName(lib, libN, sizeof(libN));
+        TryClassName(lib, libC, sizeof(libC));
+        std::string got;
+        FS* out = (FS*)(parms + 16);
+        if (PtrReadable(out->Data, 16)) {
+            char buf[128]; buf[0] = 0;
+            for (int k = 0; k < out->Num && k < 60; ++k) buf[k] = (char)(out->Data[k] & 0x7F);
+            got = buf;
+        }
+        std::string hex;
+        if (exCode == 0) {
+            for (int k = 0; k < 96; ++k) {
+                char hb[4];
+                snprintf(hb, sizeof(hb), "%02x", parms[k]);
+                hex += hb;
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, parms);
+        return std::string("{\"ok\":") + (exCode == 0 ? "true" : "false") +
+               ",\"lib\":\"" + JsonEscape(libN) + "\",\"libClass\":\"" + JsonEscape(libC) +
+               "\",\"idx\":" + std::to_string(idx) + ",\"result\":\"" + JsonEscape(got) +
+               "\",\"ex\":" + std::to_string(exCode) + ",\"hex\":\"" + hex + "\"}";
+    }
+    if (cmd == "petest") {
+        int idx = a.size() > 1 ? atoi(a[1].c_str()) : 65;
+        const char* wantClass = a.size() > 2 ? a[2].c_str() : "KismetSystemLibrary";
+        const char* wantFunc  = a.size() > 3 ? a[3].c_str() : "IsValid";
+        UObject* cdo = nullptr;
+        int n = NumObjects();
+        char nm[512], cls[256];
+        char cdoName[512];
+        snprintf(cdoName, sizeof(cdoName), "Default__%s", wantClass);
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryObjectName(o, nm, sizeof(nm))) continue;
+            if (strcmp(nm, cdoName) != 0) continue;
+            cdo = o; break;
+        }
+        if (!cdo) {
+            for (int i = 0; i < n; ++i) {
+                UObject* o = GetObjectByIndex(i);
+                if (!o) continue;
+                if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Class") != 0) continue;
+                if (!TryObjectName(o, nm, sizeof(nm)) || strcmp(nm, wantClass) != 0) continue;
+                cdo = o; break;
+            }
+        }
+        if (!cdo) return "{\"ok\":false,\"error\":\"context object not found\"}";
+        UFunction* fn = FindFunction(wantFunc);
+        if (!fn) return "{\"ok\":false,\"error\":\"function not found\"}";
+        uint8_t* parms = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 64);
+        if (!parms) return "{\"ok\":false,\"error\":\"alloc\"}";
+        *(UObject**)parms = cdo;
+        void** vt = *(void***)cdo;
+        uintptr_t fnAddr = 0;
+        if (PtrReadable(vt, (idx + 1) * 8)) fnAddr = (uintptr_t)vt[idx];
+        int exCode = PeInvokeRaw(fnAddr, cdo, fn, parms);
+        bool ok = (exCode == 0);
+        int result = *(int*)(parms + 8);
+        HeapFree(GetProcessHeap(), 0, parms);
+        return std::string("{\"ok\":") + (ok ? "true" : "false") +
+               ",\"idx\":" + std::to_string(idx) +
+               ",\"addr\":\"" + std::to_string((unsigned long long)fnAddr) +
+               "\",\"result\":" + std::to_string(result) +
+               ",\"ex\":" + std::to_string(exCode) + "}";
+    }
+    if (cmd == "calib") {
+        if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: calib <FunctionName>\"}";
+        UFunction* fn = FindFunction(a[1]);
+        if (!fn) return "{\"ok\":false,\"error\":\"function not found\"}";
+        uint8_t* f = (uint8_t*)fn;
+        if (!PtrReadable(f, 0xE0)) return "{\"ok\":false,\"error\":\"function memory unreadable\"}";
+        std::string out = "{\"ok\":true,\"numParms\":" + std::to_string(*(uint16_t*)(f + 0xB4)) +
+                          ",\"parmsSize\":" + std::to_string(*(uint16_t*)(f + 0xB6)) +
+                          ",\"func\":\"" + std::to_string((unsigned long long)*(uint64_t*)(f + 0xD0)) + "\",\"cands\":[";
+        bool firstCand = true;
+        for (int off = 0x30; off <= 0x88; off += 8) {
+            uint64_t v = *(uint64_t*)(f + off);
+            if (v < 0x10000 || v > 0x7fffffffffffULL) continue;
+            if (!PtrReadable((void*)v, 0x60)) continue;
+            if (!firstCand) out += ",";
+            firstCand = false;
+            out += "{\"ptrOff\":" + std::to_string(off) + ",\"ptr\":\"" + std::to_string(v) + "\",\"names\":[";
+            bool firstN = true;
+            for (int no = 0; no <= 0x40; no += 4) {
+                int32_t id = *(int32_t*)((uint8_t*)v + no);
+                if (id <= 0) continue;
+                char nb[256];
+                if (!DecodeNameById((uint32_t)id, nb, sizeof(nb))) continue;
+                if (!nb[0]) continue;
+                if (!firstN) out += ",";
+                firstN = false;
+                out += "{\"off\":" + std::to_string(no) + ",\"name\":\"" + JsonEscape(nb) + "\"}";
+            }
+            uint64_t nxt = 0;
+            if (PtrReadable((uint8_t*)v + 0x10, 8)) nxt = *(uint64_t*)((uint8_t*)v + 0x10);
+            out += "],\"next\":\"" + std::to_string((unsigned long long)nxt) + "\"}";
+        }
+        out += "]}";
+        return out;
+    }
+    if (cmd == "dumpobj") {
+        if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: dumpobj <name> [len]\"}";
+        int len = a.size() > 2 ? atoi(a[2].c_str()) : 0x120;
+        if (len <= 0 || len > 0x400) len = 0x120;
+        int n = NumObjects();
+        char cls[256], nm[512];
+        std::string out = "{\"ok\":true,\"items\":[";
+        int found = 0;
+        for (int i = 0; i < n && found < 8; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryObjectName(o, nm, sizeof(nm)) || a[1] != nm) continue;
+            if (!TryClassName(o, cls, sizeof(cls))) cls[0] = 0;
+            if (found) out += ",";
+            out += "{\"i\":" + std::to_string(i) + ",\"class\":\"" + JsonEscape(cls) + "\",\"hex\":\"";
+            for (int k = 0; k < len; ++k) {
+                char b[4];
+                snprintf(b, sizeof(b), "%02x", *((uint8_t*)o + k));
+                out += b;
+            }
+            out += "\"}";
+            ++found;
+        }
+        out += "],\"count\":" + std::to_string(found) + "}";
+        return out;
+    }
+    if (cmd == "findobj") {
+        if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: findobj <substr> [max]\"}";
+        int mx = a.size() > 2 ? atoi(a[2].c_str()) : 60;
+        if (mx <= 0 || mx > 1000) mx = 60;
+        std::string needle = a[1];
+        int n = NumObjects();
+        char cls[256], nm[512];
+        std::string out = "{\"ok\":true,\"items\":[";
+        int found = 0;
+        for (int i = 0; i < n && found < mx; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryObjectName(o, nm, sizeof(nm))) continue;
+            std::string s(nm);
+            if (s.find(needle) == std::string::npos) continue;
+            if (!TryClassName(o, cls, sizeof(cls))) cls[0] = 0;
+            if (found) out += ",";
+            out += "{\"i\":" + std::to_string(i) + ",\"name\":\"" + JsonEscape(nm) +
+                   "\",\"class\":\"" + JsonEscape(cls) + "\"}";
+            ++found;
+        }
+        out += "],\"count\":" + std::to_string(found) + "}";
+        return out;
+    }
+    if (cmd == "dumpfuncs") {
+        int n = NumObjects();
+        char cls[256], nm[512];
+        std::string out = "{\"ok\":true,\"functions\":[";
+        int found = 0;
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Function") != 0) continue;
+            if (!TryObjectName(o, nm, sizeof(nm))) continue;
+            UObject* outer = o->OuterPrivate;
+            char oc[256];
+            oc[0] = 0;
+            if (outer) TryObjectName(outer, oc, sizeof(oc));
+            if (found) out += ",";
+            out += "{\"f\":\"" + JsonEscape(nm) + "\",\"o\":\"" + JsonEscape(oc) + "\"}";
+            ++found;
+        }
+        out += "],\"count\":" + std::to_string(found) + "}";
+        return out;
+    }
+    if (cmd == "dumpfuncsraw") {
+        // 鍏ㄩ儴 Function 瀵硅薄锛氬師濮嬪悕瀛?id + outer 鍦板潃锛堜富鏈轰晶瑙ｇ爜锛?        int n = NumObjects();
+        char cls[256];
+        std::string out = "{\"ok\":true,\"functions\":[";
+        int found = 0;
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryClassName(o, cls, sizeof(cls)) || strcmp(cls, "Function") != 0) continue;
+            if (found) out += ",";
+            ++found;
+            out += "{\"i\":" + std::to_string(i) +
+                   ",\"addr\":\"" + std::to_string((unsigned long long)o) +
+                   "\",\"nameId\":" + std::to_string((int32_t)o->NamePrivate.ComparisonIndex) +
+                   ",\"nameNum\":" + std::to_string(o->NamePrivate.Number) +
+                   ",\"outer\":\"" + std::to_string((unsigned long long)o->OuterPrivate) + "\"}";
+        }
+        out += "],\"count\":" + std::to_string(found) + "}";
+        return out;
+    }
+    if (cmd == "members") {
+        if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: members <ClassName> [max]\"}";
+        int mx = a.size() > 2 ? atoi(a[2].c_str()) : 400;
+        if (mx <= 0 || mx > 4000) mx = 400;
+        int n = NumObjects();
+        char cls[256], nm[512];
+        std::vector<UObject*> targets;
+        for (int i = 0; i < n; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            if (!TryClassName(o, cls, sizeof(cls))) continue;
+            if (strcmp(cls, "Class") != 0 && strcmp(cls, "BlueprintGeneratedClass") != 0 &&
+                strcmp(cls, "WidgetBlueprintGeneratedClass") != 0 &&
+                strcmp(cls, "AnimBlueprintGeneratedClass") != 0) continue;
+            if (!TryObjectName(o, nm, sizeof(nm)) || a[1] != nm) continue;
+            targets.push_back(o);
+        }
+        std::string out = "{\"ok\":true,\"classes\":" + std::to_string(targets.size()) + ",\"members\":[";
+        int found = 0;
+        for (int i = 0; i < n && found < mx; ++i) {
+            UObject* o = GetObjectByIndex(i);
+            if (!o) continue;
+            bool match = false;
+            for (UObject* t : targets) if (o->OuterPrivate == t) { match = true; break; }
+            if (!match) continue;
+            if (!TryObjectName(o, nm, sizeof(nm))) continue;
+            if (!TryClassName(o, cls, sizeof(cls))) continue;
+            if (found) out += ",";
+            out += "{\"name\":\"" + JsonEscape(nm) + "\",\"kind\":\"" + JsonEscape(cls) + "\"}";
+            ++found;
+        }
+        out += "],\"count\":" + std::to_string(found) + "}";
+        return out;
+    }
+    if (cmd == "nameidx") {
+        if (a.size() < 2) return "{\"ok\":false,\"error\":\"usage: nameidx <substr> [max]\"}";
+        int mx = a.size() > 2 ? atoi(a[2].c_str()) : 40;
+        if (mx <= 0 || mx > 500) mx = 40;
+        auto hits = FindNames(a[1], mx);
+        std::string out = "{\"ok\":true,\"count\":" + std::to_string(hits.size()) + ",\"hits\":[";
+        for (size_t i = 0; i < hits.size(); ++i) {
+            if (i) out += ",";
+            out += "{\"id\":" + std::to_string(hits[i].first) +
+                   ",\"name\":\"" + JsonEscape(hits[i].second) + "\"}";
+        }
+        out += "]}";
+        return out;
+    }
+    if (cmd == "blockscan") {
+        static uintptr_t addrs[32];
+        static uint64_t words[32 * 8];
+        int hits = ScanBlockRefs(addrs, words, 32);
+        uint8_t* nb = GetNoneBlock();
+        std::string out = "{\"ok\":true,\"noneBlock\":\"" + std::to_string((unsigned long long)nb) + "\",\"hits\":[";
+        for (int i = 0; i < hits; ++i) {
+            if (i) out += ",";
+            out += "{\"addr\":" + std::to_string((unsigned long long)addrs[i]) + ",\"q\":[";
+            for (int k = 0; k < 8; ++k) {
+                if (k) out += ",";
+                out += std::to_string((unsigned long long)words[i * 8 + k]);
+            }
+            out += "]}";
+        }
+        out += "]}";
+        return out;
+    }
+    if (cmd == "findpool") {
+        uintptr_t p = DiscoverNamePool();
+        return std::string("{\"ok\":") + (p ? "true" : "false") +
+               ",\"pool\":\"" + std::to_string((unsigned long long)p) + "\"}";
+    }
+    if (cmd == "classes")  return CmdClasses(a);
+    if (cmd == "funcs")    return CmdFindFuncs(a);
+    if (cmd == "desc")     return CmdDesc(a);
+    if (cmd == "chat")     return CmdChat(a);
+    if (cmd == "announce") return CmdAnnounce(a);
+    if (cmd == "give")     return CmdGive(a);
+    if (cmd == "reinit") {
+        bool ok = InitGuarded();
+        return std::string("{\"ok\":") + (ok ? "true" : "false") +
+               ",\"objects\":" + std::to_string(NumObjects()) + "}";
+    }
+    return "{\"ok\":false,\"error\":\"unknown command\"}";
+}
+
+static void HandleLineTo(const char* line, char* out, size_t cap) {
+    std::string r = HandleLine(std::string(line));
+    snprintf(out, cap, "%s", r.c_str());
+}
+
+static void SafeHandle(const char* line, char* out, size_t cap) {
+    __try {
+        HandleLineTo(line, out, cap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        snprintf(out, cap, "{\"ok\":false,\"error\":\"exception in handler\"}");
+    }
+}
+
+static void ClientLoop(SOCKET s) {
+    std::string acc;
+    char buf[8192];
+    const size_t cap = 1 << 21;
+    char* resp = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cap);
+    if (!resp) { closesocket(s); return; }
+    for (;;) {
+        int n = recv(s, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        acc.append(buf, n);
+        size_t pos;
+        while ((pos = acc.find('\n')) != std::string::npos) {
+            std::string line = acc.substr(0, pos);
+            acc.erase(0, pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            resp[0] = 0;
+            SafeHandle(line.c_str(), resp, cap);
+            std::string out(resp);
+            out += "\n";
+            send(s, out.c_str(), (int)out.size(), 0);
+            resp[0] = 0;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, resp);
+    closesocket(s);
+}
+
+static void LoadAdminTargetAndHook() {
+    std::string path = ModuleDir() + "\\scum_harness_admin.txt";
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { Log("[admhook] no target file, skip"); return; }
+    char buf[128] = {0};
+    DWORD rd = 0;
+    ReadFile(h, buf, sizeof(buf) - 1, &rd, nullptr);
+    CloseHandle(h);
+    std::string id(buf, strnlen(buf, sizeof(buf)));
+    while (!id.empty() && (id.back() == '\r' || id.back() == '\n' || id.back() == ' ')) id.pop_back();
+    if (id.empty()) { Log("[admhook] target file empty, skip"); return; }
+    g_adminTarget = Utf8ToWide(id);
+    if (InstallAdminHook()) Log("[admhook] auto-installed for %s", id.c_str());
+    else Log("[admhook] auto-install FAILED (prologue mismatch?)");
+}
+
+static void InitWorker() {
+    unsigned retry = 0;
+    while (!g_rt.ready) {
+        if (InitGuarded()) break;
+        Sleep(2000);
+        if (++retry % 5 == 0) Log("[main] init retry %u", retry);
+        if (retry > 300) { Log("[main] init abandoned"); break; }
+    }
+    if (g_rt.ready) {
+        __try { LoadAdminTargetAndHook(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[admhook] exception during auto-install"); }
+    }
+}
+
+static void ServerThread() {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    std::thread(InitWorker).detach();
+
+    SOCKET srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (srv == INVALID_SOCKET) { Log("[main] socket failed"); return; }
+    int opt = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(kPort);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (bind(srv, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        Log("[main] bind %d failed: %d", kPort, WSAGetLastError());
+        return;
+    }
+    listen(srv, 8);
+    Log("[main] control server listening on 127.0.0.1:%d", kPort);
+
+    for (;;) {
+        SOCKET c = accept(srv, nullptr, nullptr);
+        if (c == INVALID_SOCKET) continue;
+        std::thread(ClientLoop, c).detach();
+    }
+}
+
+static DWORD WINAPI BootThread(LPVOID) {
+    ServerThread();
+    return 0;
+}
+
+extern "C" void HarnessAttach(HMODULE hModule) {
+    DisableThreadLibraryCalls(hModule);
+    AddVectoredExceptionHandler(1, GtVeh);
+    Log("[main] attached to pid %lu", GetCurrentProcessId());
+    CreateThread(nullptr, 0, BootThread, nullptr, 0, nullptr);
+}
+
