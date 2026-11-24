@@ -2,7 +2,7 @@
 
 SCUM Windows 专用服务器的本机控制工具。插件加载到服务端进程后，在 `127.0.0.1:17880` 提供控制接口，Python 客户端可发送聊天、公告和管理员命令；插件同时可以把聊天、登录和游戏日志事件实时回调到本机 HTTP 端点。
 
-这是基于引擎反射与进程内插件的控制工具，不是 SCUM 官方 RCON 协议实现。管理员命令借用在线玩家的 RPC 通道执行，需要有在线玩家及相应管理员权限；客户端脚本会优先选择 owner 带角色的通道，多人在线时不保证一定选中指定玩家。
+这是基于引擎反射与进程内插件的控制工具，不是 SCUM 官方 RCON 协议实现。聊天与公告由服务端对象直接推送，不需要玩家在线；管理员命令借用在线玩家的 RPC 通道执行，需要至少一名在线玩家提供通道，但权限校验对本地工具调用直接放行（不依赖 `AdminUsers.ini`，也不要求该玩家本身是管理员）。客户端脚本会优先选择 owner 带角色的通道，多人在线时不保证一定选中指定玩家。
 
 ## 环境要求
 
@@ -100,9 +100,17 @@ python scum-harness\client\scum_chat.py "大家好，欢迎进入服务器"
 
 `RESULT: SUCCESS` 表示插件报告调用已触发且未返回异常；是否实际显示需在在线游戏客户端确认，零玩家时无法验证消息送达。
 
-### 公告及管理员命令
+### 公告 / 通知（无需玩家在线）
 
-先让具有管理员权限的玩家上线，并确认脚本选中的通道属于有权限的玩家，然后执行：
+```bat
+python scum-harness\client\scumctl.py announce "服务器将在十分钟后重启"
+```
+
+公告由服务端 ChatManager 的 `Multicast_DisplayNotification` / `Multicast_ShowEventNotification` / `NetMulticast_RequestNotification` 直接推送给所有在线客户端，不经过玩家 RPC 通道，零玩家在线也能发送。若改用 `scum_admin.py "Announce ..."`，走的则是下面的管理员命令通道，需要在线玩家。
+
+### 管理员命令（需要在线玩家提供通道）
+
+至少一名玩家在线，用于提供 `PlayerRpcChannel`（权限不再是障碍，见下），然后执行：
 
 ```bat
 python scum-harness\client\scum_admin.py "Announce 服务器将在十分钟后重启"
@@ -118,7 +126,9 @@ python scum-harness\client\scum_admin.py --list
 - `--list` 从当前对象表列出管理员命令类，实际清单取决于服务端版本和已加载对象。
 - 返回 `fired: true`、`ex: 0` 只说明引擎调用完成；业务命令是否获准并生效，仍需查看服务端日志或游戏内结果。
 
-通道选择：脚本遍历对象表里的 `PlayerRpcChannel`，优先挑选 owner 是 `PlayerController` 且能定位到角色（pawn）的通道，其次才取对象索引最大的通道。多人在线时可以先用 `ListPlayers` 确认通道对应的玩家。
+权限：插件在管理员判定函数最前面按“调用来源”放行——本地工具（`gtcall`/`gtcallpe`）发起的调用直接返回通过，不再比对 SteamID 或 `AdminUsers.ini`；游戏内玩家手动输入的 `#` 命令仍走原始校验。因此借用的通道不需要属于管理员账号。
+
+通道选择：脚本遍历对象表里的 `PlayerRpcChannel`，优先挑选 owner 是 `PlayerController` 且能定位到角色（pawn）的通道，其次才取对象索引最大的通道（玩家重连会留下失效通道，按索引取最大容易选到过期对象）。多人在线时可以先用 `ListPlayers` 确认通道对应的玩家。
 
 相对传送示例：
 
@@ -130,7 +140,7 @@ python scum-harness\client\scum_admin.py --tp 5000 5000
 
 ### 可选：指定 SteamID 的管理员钩子
 
-插件还提供指定 SteamID 的进程内管理员判定钩子。只使用服务端原有管理员配置时，无需开启此功能。
+本地工具发起的命令已按“调用来源”放行，不需要这项配置。插件额外提供的是“指定 SteamID”的进程内管理员判定钩子，用于让某个账号在游戏内输入的 `#` 命令也判定为管理员；使用服务端原有 `AdminUsers.ini` 时，无需开启。
 
 如需沿用原工具的指定 SteamID 模式，在插件目录创建 `scum_harness_admin.txt`，内容仅为目标 SteamID，不带 BOM，然后重启服务端。PowerShell 示例：
 
@@ -252,7 +262,7 @@ D:\scum-rcon\scum-harness\injector\scum_inject.exe SCUMServer.exe D:\scum-rcon\s
 | --- | --- |
 | 连接被拒绝或超时 | 确认服务端运行、DLL 位于正确可执行文件目录、日志出现 `control server listening`；客户端必须在服务器本机运行 |
 | `stat` 尚未就绪 | 等待地图和对象表初始化，检查 `scum_harness.log` 中的初始化失败或重试信息 |
-| `no live PlayerRpcChannel` | 让玩家进入服务器；管理员命令需要在线玩家通道 |
+| `no live PlayerRpcChannel` | 让玩家进入服务器；只有管理员命令需要在线玩家通道，公告与聊天广播不需要 |
 | 命令被拒绝或无效果 | 检查所选通道玩家的管理员权限、命令参数，以及服务端日志；多人在线时先 `ListPlayers` 确认通道 |
 | 找不到 `BroadcastChatLine` | 等待地图加载或让真实客户端连接以加载所需类，再重试；检查是否为版本不兼容 |
 | 加载类失败，但聊天函数存在 | 脚本会继续尝试发送，以最终调用结果及游戏内显示为准 |
@@ -278,7 +288,6 @@ scum-rcon/
 │   └── client/                Python 控制客户端与事件接收端
 ├── scripts/scum_status.py     旧安装环境巡检脚本
 ├── Find-SCUM-Server.ps1        查找服务端的辅助脚本
-├── 清理D盘_安全项.ps1          原环境磁盘清理脚本
 └── .re/                       逆向研究脚本及数据，日常使用不需要
 ```
 
@@ -286,4 +295,4 @@ scum-rcon/
 
 `YG_CONFIG.json`、`scum_harness_admin.txt`、`scum_harness.log` 均在服务端插件目录按需生成，不随仓库分发。
 
-其余探测、清理和研究脚本保留原样，可能含原机器路径或旧版本假设，不属于安装步骤。特别是 `scripts/scum_status.py` 仍按旧的 `SCUMServer-Win64-Shipping.exe` 文件名检查，不能用它的结果代替当前服务端的实际启动验证。
+其余探测和研究脚本保留原样，可能含原机器路径或旧版本假设，不属于安装步骤。特别是 `scripts/scum_status.py` 仍按旧的 `SCUMServer-Win64-Shipping.exe` 文件名检查，不能用它的结果代替当前服务端的实际启动验证。
